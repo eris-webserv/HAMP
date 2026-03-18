@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::packet::{craft_batch, pack_string, to_hex_upper, DEFAULT_WORLD};
 use crate::packet::{
     AcceptFriendOk, AddFriendFail, AddFriendOk, AuthFail, FriendOnline, HeartbeatReply,
-    JoinGrantHostClear, JoinGrantRelay, JumpToGame, PushAccepted, PushFriendReq, PushRemoved,
+    JoinGrantHostClear, JumpToGame, PushAccepted, PushFriendReq, PushRemoved,
     RegisterFail, RegisterOk, RelayJoinReq, RelayPrivateMsg, RemoveFriendOk, ServerPacket, Str16,
 };
 use crate::state::{SessionConn, SharedState};
@@ -73,23 +73,47 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
 
 // ── Per-client handler ─────────────────────────────────────────────────────
 
-fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<SharedState>) {
+fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<SharedState>, friend_port: u16) {
+    const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    const READ_POLL:         std::time::Duration = std::time::Duration::from_secs(1);
+
     let peer_ip   = addr.ip().to_string();
     let read_copy = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => { eprintln!("[FRIEND] try_clone failed for {}: {}", addr, e); return; }
     };
+
+    // Wake up every second so we can check the heartbeat deadline even when
+    // the socket is quiet.  WouldBlock / TimedOut are handled explicitly below.
+    if let Err(e) = read_copy.set_read_timeout(Some(READ_POLL)) {
+        eprintln!("[FRIEND] set_read_timeout failed for {}: {}", addr, e);
+    }
+
     let conn = SessionConn::new_real(stream, peer_ip);
     let mut rd = read_copy;
     let mut current_user: Option<String> = None;
+    let mut last_heartbeat = std::time::Instant::now();
 
     println!("\n[FRIEND] New connection: {}", addr);
 
     let mut buf = [0u8; 8192];
     loop {
         let n = match rd.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break, // clean EOF
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                   || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Read poll fired with no data — check the heartbeat deadline.
+                if last_heartbeat.elapsed() >= HEARTBEAT_TIMEOUT {
+                    println!("[FRIEND] {} timed out (no heartbeat for {}s)",
+                        current_user.as_deref().unwrap_or(&addr.to_string()),
+                        HEARTBEAT_TIMEOUT.as_secs());
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break, // real I/O error
         };
         let data = &buf[..n];
 
@@ -109,6 +133,10 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
                 continue;
             }
         };
+
+        // Any valid packet resets the heartbeat deadline.
+        last_heartbeat = std::time::Instant::now();
+
         println!("\n[CLIENT -> FRIEND] [{}] | {}", packet.id().name(), to_hex_upper(data));
 
         match packet {
@@ -328,10 +356,9 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
             }
 
             // ── JOIN REQUEST (0x2D) ────────────────────────────────────────
-            // Relays the request directly to the target host. Unlike the
-            // older intercept there is no auto-grant for dummy sessions here —
-            // the host is always responsible for responding with JOIN_GRANT.
-            ClientPacket::JoinReq { target: target_raw, extra_byte } => {
+            // Relays the request to the target host. Extra byte is always 0x00
+            // per Ghidra analysis — the client value is ignored.
+            ClientPacket::JoinReq { target: target_raw, .. } => {
                 if let Some(ref user) = current_user {
                     let t = target_raw.to_lowercase();
                     let target_conn = state.sessions.read().unwrap()
@@ -341,7 +368,7 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
                         tc.send_pkt(
                             &RelayJoinReq {
                                 from:       Str16::new(user),
-                                extra_byte,
+                                extra_byte: 0x00,
                             },
                             "S->C [RELAY_JOIN_REQ]",
                         );
@@ -350,38 +377,30 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
             }
 
             // ── JOIN GRANT (0x2B) ──────────────────────────────────────────
-            // The host grants or denies the joiner's request.
-            //
-            // On grant (status=1):
-            //   1. Clear the host's "Allowing…" popup (empty 0x2B echo).
-            //   2. Send the grant relay to the joiner.
-            //   3. Send a JumpToGame (0x25) P2P handoff packet to the joiner.
+            // Ghidra shows the client reads 0x2B as an empty payload — the
+            // status/room fields are never parsed by the game on receipt.
+            // Correct sequence (confirmed by intercept analysis):
+            //   1. Send empty 0x2B to HOST  → clears the "Allowing…" popup.
+            //   2. Send empty 0x2B to JOINER → unfreezes the joiner's UI.
+            //   3. Send 0x25 JUMP to JOINER  → triggers the P2P handoff.
             ClientPacket::JoinGrant { target: target_raw, status, room_name } => {
                 if let Some(ref user) = current_user {
                     let t = target_raw.to_lowercase();
 
-                    // Always clear the host popup first.
-                    conn.send_pkt(&JoinGrantHostClear, "S->C [HOST_UI_CLEAR]");
+                    // 1. Unfreeze the host.
+                    conn.send_pkt(&JoinGrantHostClear, "S->C [ECHO_UNFREEZE_HOST]");
 
                     let target_conn = state.sessions.read().unwrap()
                         .get(&t)
                         .map(Arc::clone);
 
                     if let Some(tc) = target_conn {
-                        let room = room_name.clone().unwrap_or_default();
+                        // 2. Unfreeze the joiner.
+                        tc.send_pkt(&JoinGrantHostClear, "S->C [JOINER_UI_UNFREEZE]");
 
-                        // Relay the grant/deny decision to the joiner.
-                        tc.send_pkt(
-                            &JoinGrantRelay {
-                                from:      Str16::new(user),
-                                status,
-                                room_name: if status == 1 { Some(Str16::new(&room)) } else { None },
-                            },
-                            "S->C [JOINER_UI_RELAY]",
-                        );
-
-                        // On grant, fire the P2P handoff.
+                        // 3. Fire the P2P handoff jump signal.
                         if status == 1 {
+                            let room    = room_name.unwrap_or_default();
                             let host_ip = conn.peer_ip().to_string();
                             let display = state.db.get_display(user)
                                 .unwrap_or_else(|| user.clone());
@@ -391,7 +410,7 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
                                     token:         Str16::new(&room),
                                     host_ip:       Str16::new(&host_ip),
                                     mode:          Str16::new("P2P"),
-                                    port:          7003,
+                                    port:          friend_port,
                                     password_flag: 0x00,
                                 },
                                 "S->C [JUMP_SIGNAL_0x25]",
@@ -449,7 +468,8 @@ pub fn run(cfg: &Config, state: Arc<SharedState>) {
                 let peer = stream.peer_addr()
                     .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                 let state = Arc::clone(&state);
-                std::thread::spawn(move || handle_client(stream, peer, state));
+                let friend_port = cfg.friend_port;
+                std::thread::spawn(move || handle_client(stream, peer, state, friend_port));
             }
             Err(e) => eprintln!("[FRIEND] accept error: {}", e),
         }
