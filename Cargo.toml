@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+binrw = "0.15.1"
+chrono = "0.4.44"
+rand = "0.10.0"
 rusqlite = "0.39.0"
 serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.0.7"
 utf16string = "0.2.0"

@@ -1,4 +1,5 @@
 mod admin;
+mod config;
 mod db;
 mod friend_server;
 mod game_server;
@@ -8,7 +9,10 @@ mod structs;
 
 use std::sync::Arc;
 
+use crate::{db::Db, state::SharedState};
+
 fn main() {
+    let cfg = config::load();
     let args: Vec<String> = std::env::args().collect();
 
     // ── Console mode (separate window) ────────────────────────────────────
@@ -17,35 +21,24 @@ fn main() {
         return;
     }
 
+    let db_path = std::env::current_exe()
+        .expect("could not locate executable")
+        .parent()
+        .expect("executable has no parent directory")
+        .join(&cfg.db_path);
+
+    let db = Db::open(db_path.to_str().expect("db path is not valid UTF-8"))
+        .expect("failed to open database");
+
     // ── Server mode ───────────────────────────────────────────────────────
-    //let shared = SharedState::new();
+    let shared = SharedState::new(db);
 
-    // Optionally start the admin bridge and console window.
-    /*let db = db::load_db();
-    if db.config.admin_console_enabled {
-        let state = Arc::clone(&shared);
-        std::thread::spawn(move || admin::run_admin_bridge(state));
-
-        // On Windows, spawn a new cmd window for the admin CLI automatically.
-        #[cfg(target_os = "windows")]
-        {
-            use std::process::Command;
-            if let Ok(exe) = std::env::current_exe() {
-                let _ = Command::new("cmd")
-                    .args(["/c", "start", "cmd", "/k"])
-                    .arg(exe)
-                    .arg("console")
-                    .spawn();
-            }
-        }
-    }
-
-    println!(":3");
+    println!("[HAMP] Launching!");
 
     // Game server runs on a background thread; friend server runs here on
     // the main thread so the process lives as long as the friend server does.
-    let gs_state = Arc::clone(&shared);
-    std::thread::spawn(move || game_server::run_game_server(gs_state));
+    //let gs_state = Arc::clone(&shared);
+    //std::thread::spawn(move || game_server::run_game_server(gs_state));
 
-    friend_server::run_friend_server(shared);*/
+    friend_server::run(&cfg, shared);
 }

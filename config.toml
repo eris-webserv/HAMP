@@ -1,0 +1,26 @@
+# Friend server configuration
+# Edit and restart the server to apply changes.
+
+# ── Network ────────────────────────────────────────────────────────────────
+# Interface to bind on.  "0.0.0.0" listens on all interfaces.
+host = "0.0.0.0"
+
+# Friend-list / social server (clients connect here).
+friend_port = 7002
+
+# Game-server stub.
+game_port = 7003
+
+# ── Admin (always bound to 127.0.0.1) ─────────────────────────────────────
+# Port for the admin bridge — receives CLI commands.
+admin_port = 7004
+
+# Port for the admin event listener — receives CHAT_RECV notifications.
+event_port = 7005
+
+# Set to false to disable the admin console entirely.
+admin_console = true
+
+# ── Persistence ────────────────────────────────────────────────────────────
+# Path to the SQLite database file (relative to the server's working dir).
+db_path = "friend_server.db"
