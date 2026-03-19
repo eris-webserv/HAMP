@@ -17,7 +17,7 @@ use crate::packet::{
 use crate::state::{SessionConn, SharedState};
 use crate::packet::ClientPacket;
 
-// ── Token generation ───────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────
 
 fn random_token() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 12)
@@ -38,10 +38,10 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
     // ── Friend list ────────────────────────────────────────────────────────
     let friends = state.db.get_friends(username);
     resp.extend_from_slice(&(friends.len() as u16).to_le_bytes());
-    for (f_user, f_display) in &friends {
+    for f_user in &friends {
         let is_on: u8 = if sessions.contains_key(f_user.as_str()) { 1 } else { 0 };
         resp.extend_from_slice(&pack_string(f_user));
-        resp.extend_from_slice(&pack_string(f_display));
+        resp.extend_from_slice(&pack_string(f_user)); // username = display
         resp.push(is_on);
         if is_on == 1 {
             let w = worlds.get(f_user.as_str()).map(|w| w.as_slice()).unwrap_or(DEFAULT_WORLD);
@@ -54,17 +54,17 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
     // ── Outbound pending requests (status=2: you sent them a request) ─────
     let outbound = state.db.get_pending_outbound(username);
     resp.extend_from_slice(&(outbound.len() as u16).to_le_bytes());
-    for (u, d) in &outbound {
+    for u in &outbound {
         resp.extend_from_slice(&pack_string(u));
-        resp.extend_from_slice(&pack_string(d));
+        resp.extend_from_slice(&pack_string(u));
     }
 
     // ── Inbound pending requests (status=3: they sent you a request) ──────
     let inbound = state.db.get_pending_inbound(username);
     resp.extend_from_slice(&(inbound.len() as u16).to_le_bytes());
-    for (u, d) in &inbound {
+    for u in &inbound {
         resp.extend_from_slice(&pack_string(u));
-        resp.extend_from_slice(&pack_string(d));
+        resp.extend_from_slice(&pack_string(u));
     }
 
     // ── Fixed trailer: N_ToPing(0) give_gems(0) warn(0) unk(0) N_trophy(0) ─
@@ -89,18 +89,17 @@ pub fn handle_packet(
         // ── REGISTER (0x0A) ────────────────────────────────────────────────
         // Creates a new account with a randomly generated token.
         ClientPacket::RegisterReq { username } => {
-            let u = username.to_lowercase();
-            if state.db.player_exists(&u) {
+            if state.db.player_exists(&username) {
                 conn.send_pkt(
                     &RegisterFail { reason: Str16::new("Taken") },
                     "S->C [REG_FAIL]",
                 );
             } else {
                 let token = random_token();
-                state.db.create_player(&u, &username, &token);
+                state.db.create_player(&username, &token);
                 conn.send_pkt(
                     &RegisterOk {
-                        username: Str16::new(&u),
+                        username: Str16::new(&username),
                         display:  Str16::new(&username),
                         token:    Str16::new(&token),
                     },
@@ -112,23 +111,23 @@ pub fn handle_packet(
         // ── LOGIN (0x0B) ───────────────────────────────────────────────────
         // Validates credentials then sends the full friend/pending list.
         ClientPacket::Login { username, token } => {
-            let u = username.to_lowercase();
-            let player = state.db.get_player(&u);
+            let player = state.db.get_player(&username);
             let authed = player.as_ref().map(|p| p.token == token).unwrap_or(false);
 
             if authed {
-                *current_user = Some(u.clone());
+                // Use the stored casing as the canonical session key.
+                let canonical = player.unwrap().username;
+                *current_user = Some(canonical.clone());
 
-                // Register session and seed world state if not present.
                 state.sessions.write().unwrap()
-                    .insert(u.clone(), Arc::clone(conn));
+                    .insert(canonical.clone(), Arc::clone(conn));
                 state.world_states.write().unwrap()
-                    .entry(u.clone())
+                    .entry(canonical.clone())
                     .or_insert_with(|| DEFAULT_WORLD.to_vec());
 
-                state.broadcast_status(&u, true);
+                state.broadcast_status(&canonical, true);
 
-                let resp = build_login_success(&u, state);
+                let resp = build_login_success(&canonical, state);
                 conn.send(2, &resp, "S->C [LOGIN_SUCCESS]");
             } else {
                 conn.send_pkt(&AuthFail, "S->C [AUTH_FAIL]");
@@ -149,14 +148,16 @@ pub fn handle_packet(
         // PushFriendReq uses username FIRST, display SECOND.
         ClientPacket::AddFriend { target: target_raw } => {
             if let Some(ref user) = *current_user {
-                let t = target_raw.to_lowercase();
+                // Resolve to canonical stored casing.
+                let t = state.db.get_player(&target_raw)
+                    .map(|p| p.username)
+                    .unwrap_or_else(|| target_raw.clone());
 
                 if t != *user && state.db.add_friend_request(user, &t) {
-                    let t_display = state.db.get_display(&t).unwrap_or_else(|| t.clone());
                     conn.send_pkt(
                         &AddFriendOk {
-                            display:  Str16::new(&t_display),
-                            username: Str16::new(&target_raw),
+                            display:  Str16::new(&t),
+                            username: Str16::new(&t),
                         },
                         "S->C [ADD_OK]",
                     );
@@ -166,11 +167,10 @@ pub fn handle_packet(
                         .get(&t)
                         .map(Arc::clone);
                     if let Some(tc) = target_conn {
-                        let my_display = state.db.get_display(user).unwrap_or_else(|| user.clone());
                         tc.send_pkt(
                             &PushFriendReq {
                                 username: Str16::new(user),
-                                display:  Str16::new(&my_display),
+                                display:  Str16::new(user),
                             },
                             "S->C [PUSH_REQ]",
                         );
@@ -190,7 +190,9 @@ pub fn handle_packet(
         // online), and FR_ONLINE syncs to both parties.
         ClientPacket::AcceptFriend { target: target_raw } => {
             if let Some(ref user) = *current_user {
-                let t = target_raw.to_lowercase();
+                let t = state.db.get_player(&target_raw)
+                    .map(|p| p.username)
+                    .unwrap_or_else(|| target_raw.clone());
 
                 if state.db.accept_friend(user, &t) {
                     let sessions = state.sessions.read().unwrap();
@@ -205,7 +207,7 @@ pub fn handle_packet(
                     };
                     conn.send_pkt(
                         &AcceptFriendOk {
-                            target:     Str16::new(&target_raw),
+                            target:     Str16::new(&t),
                             is_online:  is_on_t as u8,
                             world_data: world_t.clone(),
                         },
@@ -213,8 +215,6 @@ pub fn handle_packet(
                     );
 
                     if let Some(tc) = sessions.get(&t).map(Arc::clone) {
-                        let my_display = state.db.get_display(user)
-                            .unwrap_or_else(|| user.clone());
                         let world_u = worlds.get(user.as_str())
                             .cloned()
                             .unwrap_or_else(|| DEFAULT_WORLD.to_vec());
@@ -223,7 +223,7 @@ pub fn handle_packet(
                         tc.send_pkt(
                             &PushAccepted {
                                 username:   Str16::new(user),
-                                display:    Str16::new(&my_display),
+                                display:    Str16::new(user),
                                 world_data: world_u.clone(),
                             },
                             "S->C [PUSH_ACCEPTED]",
@@ -249,6 +249,13 @@ pub fn handle_packet(
                             "S->C [SYNC_ONLINE]",
                         );
                     }
+                } else {
+                    // No pending request found (already accepted, or never existed).
+                    // Send AddFriendFail so the client unblocks and cleans up its UI.
+                    conn.send_pkt(
+                        &AddFriendFail { target: Str16::new(&target_raw) },
+                        "S->C [ACCEPT_FAIL]",
+                    );
                 }
             }
         }
@@ -256,11 +263,13 @@ pub fn handle_packet(
         // ── REMOVE FRIEND (0x18) ───────────────────────────────────────────
         ClientPacket::RemoveFriend { target: target_raw } => {
             if let Some(ref user) = *current_user {
-                let t = target_raw.to_lowercase();
+                let t = state.db.get_player(&target_raw)
+                    .map(|p| p.username)
+                    .unwrap_or_else(|| target_raw.clone());
                 state.db.remove_friend(user, &t);
 
                 conn.send_pkt(
-                    &RemoveFriendOk { target: Str16::new(&target_raw) },
+                    &RemoveFriendOk { target: Str16::new(&t) },
                     "S->C [REMOVE_OK]",
                 );
 
@@ -282,7 +291,9 @@ pub fn handle_packet(
         // to the admin event listener.
         ClientPacket::PrivateMsg { target: target_raw, message } => {
             if let Some(ref user) = *current_user {
-                let t = target_raw.to_lowercase();
+                let t = state.db.get_player(&target_raw)
+                    .map(|p| p.username)
+                    .unwrap_or_else(|| target_raw.clone());
 
                 let target_conn = state.sessions.read().unwrap()
                     .get(&t)
@@ -305,7 +316,9 @@ pub fn handle_packet(
         // per Ghidra analysis — the client value is ignored.
         ClientPacket::JoinReq { target: target_raw, .. } => {
             if let Some(ref user) = *current_user {
-                let t = target_raw.to_lowercase();
+                let t = state.db.get_player(&target_raw)
+                    .map(|p| p.username)
+                    .unwrap_or_else(|| target_raw.clone());
                 let target_conn = state.sessions.read().unwrap()
                     .get(&t)
                     .map(Arc::clone);
@@ -330,7 +343,9 @@ pub fn handle_packet(
         //   3. Send 0x25 JUMP to JOINER  → triggers the P2P handoff.
         ClientPacket::JoinGrant { target: target_raw, status, room_name } => {
             if let Some(ref user) = *current_user {
-                let t = target_raw.to_lowercase();
+                let t = state.db.get_player(&target_raw)
+                    .map(|p| p.username)
+                    .unwrap_or_else(|| target_raw.clone());
 
                 // 1. Unfreeze the host.
                 conn.send_pkt(&JoinGrantHostClear, "S->C [ECHO_UNFREEZE_HOST]");
@@ -345,14 +360,12 @@ pub fn handle_packet(
 
                     // 3. Spawn a server-side game session and redirect both players.
                     if status == 1 {
-                        let room    = room_name.unwrap_or_else(|| user.clone());
-                        let display = state.db.get_display(user)
-                            .unwrap_or_else(|| user.clone());
-                        let ip = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
+                        let room = room_name.unwrap_or_else(|| user.clone());
+                        let ip   = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
 
                         if let Some(port) = game_server::spawn_session(room.clone(), cfg) {
                             let jump = JumpToGame {
-                                display:       Str16::new(&display),
+                                display:       Str16::new(user),
                                 token:         Str16::new(&room),
                                 host_ip:       Str16::new(ip),
                                 mode:          Str16::new("P2P"),
@@ -466,9 +479,21 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
     }
 
     // ── Cleanup on disconnect ──────────────────────────────────────────────
+    // Only remove the session entry if it still points to *this* connection.
+    // A kicked client may reconnect before this cleanup runs; in that case a
+    // new session has already been inserted and we must not evict it.
     if let Some(ref user) = current_user {
-        state.sessions.write().unwrap().remove(user);
-        state.broadcast_status(user, false);
+        let mut sessions = state.sessions.write().unwrap();
+        let is_ours = sessions.get(user)
+            .map(|s| Arc::ptr_eq(s, &conn))
+            .unwrap_or(false);
+        if is_ours {
+            sessions.remove(user);
+            drop(sessions);
+            state.broadcast_status(user, false);
+        } else {
+            drop(sessions);
+        }
         println!("\n[FRIEND] {} disconnected", user);
     }
 }

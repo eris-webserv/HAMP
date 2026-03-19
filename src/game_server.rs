@@ -23,7 +23,7 @@ use crate::packet::{craft_batch, pack_string, unpack_string};
 struct GamePlayer {
     /// Cloned stream handle used by other threads to push data to this player.
     sink:         Mutex<TcpStream>,
-    /// Last received PLAYER_DATA blob, replayed to players who join later.
+    /// Last received PLAYER_DATA blob (C→S 0x03 body), replayed to players who join later.
     initial_data: Mutex<Option<Vec<u8>>>,
 }
 
@@ -63,61 +63,99 @@ impl Session {
 
 // ── Wire-packet builders ────────────────────────────────────────────────────
 
-/// S→C 0x26 LOGIN_RESPONSE
-/// RE from GameServerReceiver::OnReceive case 0x26: 3×GetString + 3×GetShort.
-fn build_login_response(player_id: &str, world_name: &str) -> Vec<u8> {
-    let mut p = vec![0x26u8];
-    p.extend(pack_string(player_id));
-    p.extend(pack_string(world_name));
-    p.extend(pack_string(player_id)); // token = player_id
-    p.extend_from_slice(&[0u8; 6]);   // 3 × i16 state flags
+/// S→C 0x02 LOGIN_SUCCESS
+///
+/// RE from GameServerReceiver::OnReceive case 2:
+///   GetString()  server_name
+///   GetByte()    is_host
+///   GetByte()    ignored
+///   GetString()  validator_code
+///   GetShort()   validator_variation
+///   GetShort()   n_others   → if is_host && n_others > 0: n_others × GetString()
+fn build_login_success(server_name: &str) -> Vec<u8> {
+    let mut p = vec![0x02u8];
+    p.extend(pack_string(server_name)); // server_name
+    p.push(0x00);                       // is_host = false
+    p.push(0x00);                       // ignored
+    p.extend(pack_string(""));          // validator_code = ""
+    p.extend_from_slice(&0i16.to_le_bytes()); // validator_variation = 0
+    p.extend_from_slice(&0i16.to_le_bytes()); // n_others = 0
     p
 }
 
-/// S→C 0x0B ZONE_SUCCESS
-/// RE from ProcessIncomingZoneData: GetString + ZoneData::UnpackFromWeb + GetByte.
-/// ZoneData blob: InventoryItem (3×u16=0) | ZoneType (u8) | 4×u16 |
-///                ZoneName (Str) | TimerCount (u16=0)
-fn build_zone(zone_name: &str, zone_type: u8) -> Vec<u8> {
-    let mut blob: Vec<u8> = vec![0u8; 6]; // InventoryItem: 3 shorts
-    blob.push(zone_type);
-    blob.extend_from_slice(&[0u8; 8]); // 4 shorts
-    blob.extend(pack_string(zone_name));
-    blob.extend_from_slice(&[0u8; 2]); // timer count = 0
-
-    let mut p = vec![0x0Bu8];
-    p.extend(pack_string(zone_name)); // leading zone name string
-    p.extend(blob);
-    p.push(zone_type); // trailing zone type byte
+/// S→C 0x05 FULLY_IN_GAME
+///
+/// RE from GameServerReceiver::OnReceive case 5:
+///   GetShort()  n_ids → n_ids × GetLong() unique_id
+///   GetShort()  daynight  (time × 1000 as i16; 12000 = noon)
+///   GetShort()  n_perks → n_perks × GetString() perk_name
+///   GetByte()   is_moderator
+///   GetByte()   max_companions
+///   GetByte()   last_byte  (0 → client requests zone via C→S 0x0A)
+///   GetByte()   pvp
+///   GetByte()   ignored
+fn build_fully_in_game() -> Vec<u8> {
+    let mut p = vec![0x05u8];
+    p.extend_from_slice(&0i16.to_le_bytes());     // n_ids = 0
+    p.extend_from_slice(&12000i16.to_le_bytes()); // daynight = noon
+    p.extend_from_slice(&0i16.to_le_bytes());     // n_perks = 0
+    p.push(0x00); // is_moderator
+    p.push(0x00); // max_companions
+    p.push(0x00); // last_byte = 0 → client will send REQ_ZONE_DATA
+    p.push(0x00); // pvp
+    p.push(0x00); // ignored
     p
 }
 
-/// S→C 0x0D CHUNK_DATA
-/// RE from ChunkData::UnpackFromWeb: x/z (2×i16), ZoneName, offsets (4×i16),
-/// SubZone, unkString, LayerCount (u8=0), TimerCount (u16=0).
-fn build_chunk(x: i16, z: i16, zone_name: &str, dim: i16, sub_zone: &str) -> Vec<u8> {
-    let mut p = vec![0x0Du8];
-    p.extend_from_slice(&x.to_le_bytes());
-    p.extend_from_slice(&z.to_le_bytes());
-    p.extend(pack_string(zone_name));
-    p.extend_from_slice(&x.to_le_bytes());
-    p.extend_from_slice(&z.to_le_bytes());
-    p.extend_from_slice(&dim.to_le_bytes());
-    p.extend_from_slice(&[0u8; 2]); // unk short
-    p.extend(pack_string(sub_zone));
-    p.extend(pack_string("")); // extra unk string
-    p.push(0); // layer count
-    p.extend_from_slice(&[0u8; 2]); // timer count
+/// S→C 0x0B ZONE_ASSIGNMENT
+///
+/// RE from GameServerReceiver::OnReceive case 0x0B:
+///   GetByte()  status   (0 → UnknownZoneGotoSpawn(true, false))
+///   GetByte()  is_host
+fn build_zone_assignment() -> Vec<u8> {
+    vec![0x0Bu8, 0x00, 0x00]
+}
+
+/// S→C 0x13 PLAYER_GONE
+///
+/// RE from GameServerReceiver::OnReceive case 0x13 (byte 0 = gone):
+///   GetByte()   0 = gone
+///   GetString() username
+///   GetByte()   mob_count → mob_count × GetString() mob_id
+fn build_player_gone(username: &str) -> Vec<u8> {
+    let mut p = vec![0x13u8, 0x00]; // type = gone
+    p.extend(pack_string(username));
+    p.push(0x00); // mob_count = 0
     p
 }
 
-/// S→C 0x29 UNIQUE_IDS
-fn build_unique_ids(count: u16) -> Vec<u8> {
-    let mut p = vec![0x29u8];
-    p.extend_from_slice(&count.to_le_bytes());
-    for i in 1u64..=count as u64 {
-        p.extend_from_slice(&i.to_le_bytes());
-    }
+/// S→C 0x13 NEW_PLAYER_NEARBY
+///
+/// RE from GameServerReceiver::OnReceive case 0x13 (byte 1 = new):
+///   GetByte()   1 = new
+///   GetString() username
+///   GetString() display_name
+///   OnlinePlayerData::Unpack(reader)
+///     UnpackPosition(at)
+///     UnpackPosition(to)
+///     UnpackRotation(rot)
+///     GetByte()   is_dead
+///     GetString() currently_using
+///     GetString() sitting_in_chair
+///     GetLong()   level
+///     3 × InventoryItem::UnpackFromWeb
+///     GetLong()   hp_max
+///     GetLong()   hp
+///     GetLong()   hp_regen
+///     GetShort()  creature_count → creature_count × GetString() creature_name
+///
+/// `player_data_body` is the raw body from C→S 0x03 (SendInitialPlayerData),
+/// forwarded as-is into the OnlinePlayerData slot.
+fn build_player_nearby(username: &str, player_data_body: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x13u8, 0x01]; // type = new
+    p.extend(pack_string(username)); // username
+    p.extend(pack_string(username)); // display_name (same for now)
+    p.extend_from_slice(player_data_body);
     p
 }
 
@@ -162,6 +200,13 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // ── LOGIN (0x26) ───────────────────────────────────────────────
             // C→S: [WorldName: Str] [Token: Str]
             // RE from GameServerSender$$SendLoginAttempt.
+            //
+            // Response sequence:
+            //   S→C 0x02  LOGIN_SUCCESS   (client auto-calls SendInitialPlayerData)
+            //   → client sends C→S 0x03
+            //   S→C 0x05  FULLY_IN_GAME   (last_byte=0 → client sends REQ_ZONE_DATA)
+            //   → client sends C→S 0x0A
+            //   S→C 0x0B  ZONE_ASSIGNMENT (status=0 → UnknownZoneGotoSpawn)
             0x26 => {
                 if player_id.is_some() { continue; } // ignore repeated logins
 
@@ -188,19 +233,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
                 println!("[GAME:'{}'] {} → player_id='{}'", world, addr, uid);
 
-                let _ = stream.write_all(&craft_batch(2, &build_login_response(&uid, &world)));
-                let _ = stream.write_all(&craft_batch(2, &build_unique_ids(16)));
-                let _ = stream.write_all(&craft_batch(2, &build_zone(&world, 0)));
-
-                // S→C 0x1E NOTIFY_LOGIN: [PlayerID: Str] [0x00]
-                let mut notif = vec![0x1Eu8];
-                notif.extend(pack_string(&uid));
-                notif.push(0x00);
-                let _ = stream.write_all(&craft_batch(2, &notif));
+                // S→C 0x02: login success
+                let _ = stream.write_all(&craft_batch(2, &build_login_success(&world)));
+                // 0x05 and 0x0B come after we receive C→S 0x03 (PLAYER_DATA).
             }
 
             // ── PLAYER_DATA (0x03) ─────────────────────────────────────────
             // Store and broadcast to others; replay existing players to newcomer.
+            // Then send 0x05 FULLY_IN_GAME so the client requests zone data.
             0x03 => {
                 if let Some(ref uid) = player_id {
                     let body = data[10..].to_vec();
@@ -210,13 +250,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         *p.initial_data.lock().unwrap() = Some(body.clone());
                     }
 
-                    // 2. Broadcast this player's data to everyone else.
-                    let mut bcast = vec![0x03u8];
-                    bcast.extend(pack_string(uid));
-                    bcast.extend_from_slice(&body);
-                    session.broadcast(&bcast, Some(uid.as_str()));
+                    // 2. Broadcast NEW_PLAYER_NEARBY (0x13 type=1) to all other players.
+                    session.broadcast(&build_player_nearby(uid, &body), Some(uid.as_str()));
 
-                    // 3. Send all existing players' data to this newcomer.
+                    // 3. Send all existing players' data to this newcomer as 0x13 type=1.
                     let existing: Vec<(String, Vec<u8>)> = session.players.lock().unwrap()
                         .iter()
                         .filter(|(n, _)| n.as_str() != uid.as_str())
@@ -227,18 +264,35 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         })
                         .collect();
                     for (name, init) in existing {
-                        let mut pkt = vec![0x03u8];
-                        pkt.extend(pack_string(&name));
-                        pkt.extend_from_slice(&init);
-                        let _ = stream.write_all(&craft_batch(2, &pkt));
+                        let _ = stream.write_all(&craft_batch(2, &build_player_nearby(&name, &init)));
                     }
+
+                    // 4. Send FULLY_IN_GAME (0x05) → client will send C→S 0x0A (REQ_ZONE_DATA).
+                    let _ = stream.write_all(&craft_batch(2, &build_fully_in_game()));
                 }
             }
 
-            // ── POSITION (0x11) → relay as S→C 0x09 ─────────────────────
+            // ── REQ_ZONE_DATA (0x0A) ──────────────────────────────────────
+            // C→S: [zone_name: Str] [type: u8] [if type 2|3: packed_position]
+            // Respond with 0x0B status=0 is_host=0 → UnknownZoneGotoSpawn(true, false)
+            // which lets the client pick its own spawn point.
+            0x0A => {
+                let _ = stream.write_all(&craft_batch(2, &build_zone_assignment()));
+            }
+
+            // ── REQ_CHUNK (0x0C) ──────────────────────────────────────────
+            // We don't serve chunks — ignore silently.
+            0x0C => {}
+
+            // ── POSITION (0x11) → relay as S→C 0x11 ─────────────────────
+            // RE from GameServerReceiver::OnReceive case 0x11:
+            //   GetString()      username
+            //   UnpackPosition() at
+            //   UnpackPosition() to
+            //   UnpackRotation() rot
             0x11 => {
                 if let Some(ref uid) = player_id {
-                    let mut pkt = vec![0x09u8];
+                    let mut pkt = vec![0x11u8];
                     pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
                     session.broadcast(&pkt, Some(uid.as_str()));
@@ -263,25 +317,6 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     pkt.extend(pack_string(uid));
                     pkt.extend(pack_string(&msg));
                     session.broadcast(&pkt, Some(uid.as_str()));
-                }
-            }
-
-            // ── REQ_ZONE_DATA (0x0A) ──────────────────────────────────────
-            0x0A => {
-                let (zone_name, off) = unpack_string(data, 10);
-                let zone_type = data.get(off).copied().unwrap_or(0);
-                let _ = stream.write_all(&craft_batch(2, &build_zone(&zone_name, zone_type)));
-            }
-
-            // ── REQ_CHUNK (0x0C) ──────────────────────────────────────────
-            0x0C => {
-                let (zone_name, off) = unpack_string(data, 10);
-                if data.len() >= off + 5 {
-                    let x   = i16::from_le_bytes([data[off],     data[off + 1]]);
-                    let z   = i16::from_le_bytes([data[off + 2], data[off + 3]]);
-                    let dim = data[off + 4] as i16;
-                    let (sub_zone, _) = unpack_string(data, off + 5);
-                    let _ = stream.write_all(&craft_batch(2, &build_chunk(x, z, &zone_name, dim, &sub_zone)));
                 }
             }
 
@@ -353,12 +388,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
         }
     }
 
-    // Disconnect cleanup.
+    // Disconnect cleanup: remove player and notify others via 0x13 type=gone.
     if let Some(ref uid) = player_id {
         session.players.lock().unwrap().remove(uid.as_str());
-        let mut gone = vec![0x07u8];
-        gone.extend(pack_string(uid));
-        session.broadcast(&gone, None);
+        session.broadcast(&build_player_gone(uid), None);
         println!("[GAME:'{}'] '{}' disconnected ({})", session.room_token, uid, addr);
     }
 }

@@ -148,7 +148,7 @@ impl SharedState {
             "S->C [BROADCAST_OFFLINE]"
         };
         let sessions = self.sessions.read().unwrap();
-        for (friend, _) in &friends {
+        for friend in &friends {
             if let Some(conn) = sessions.get(friend.as_str()) {
                 conn.send(2, &payload, label);
             }

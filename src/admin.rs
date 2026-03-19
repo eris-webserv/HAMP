@@ -3,6 +3,7 @@
 // Connect with: nc <host> <terminal_port>
 //
 // After authenticating, send one command per line:
+//   help                  — list all commands
 //   list                  — show online users and their IPs
 //   send <user|*> <hex>   — send a raw payload to one user or everyone
 //   kick <user>           — forcibly disconnect a user
@@ -12,6 +13,8 @@
 //   unspoof               — tear down the active fake session
 //   recv <hex>            — feed a raw client packet to the spoofed user
 //   reports               — list all player reports
+//   db <base64-sql>       — run a raw SQL query against the database
+//   restart               — kill the server process (systemd will restart it)
 //
 // Adding a new command
 // ────────────────────
@@ -21,6 +24,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+
+use base64::Engine as _;
 
 use crate::config::Config;
 use crate::friend_server::handle_packet;
@@ -36,11 +41,13 @@ struct AdminSession {
     spoof_conn:   Option<Arc<SessionConn>>,
     /// Server config forwarded to handle_packet.
     cfg:          Config,
+    /// Set to true by the `exit` command to break the session loop.
+    exit:         bool,
 }
 
 impl AdminSession {
     fn new(cfg: Config) -> Self {
-        Self { spoofed_user: None, spoof_conn: None, cfg }
+        Self { spoofed_user: None, spoof_conn: None, cfg, exit: false }
     }
 
     /// Tears down any active spoof: removes the session and broadcasts offline.
@@ -93,7 +100,7 @@ fn session(mut stream: TcpStream, password: String, state: Arc<SharedState>, cfg
         }
     }
 
-    let _ = stream.write_all(b"OK\n");
+    let _ = stream.write_all(b"Hello. Run 'help' to get the current list of commands.\n");
     println!("[terminal] {} authenticated", peer);
 
     let mut adm = AdminSession::new(cfg);
@@ -109,6 +116,10 @@ fn session(mut stream: TcpStream, password: String, state: Arc<SharedState>, cfg
         let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
         let response = dispatch(cmd, args, &mut adm, &state);
         let _ = stream.write_all(response.as_bytes());
+        if adm.exit {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            break;
+        }
     }
 
     // On disconnect, clean up any active spoof.
@@ -129,6 +140,10 @@ fn dispatch(cmd: &str, args: &str, adm: &mut AdminSession, state: &SharedState) 
         "unspoof" => cmd_unspoof(adm, state),
         "recv"    => cmd_recv(adm, state, args),
         "reports" => cmd_reports(state),
+        "db"      => cmd_db(state, args),
+        "restart" => cmd_restart(),
+        "help"    => cmd_help(),
+        "exit"    => cmd_exit(adm),
         other     => format!("[!] Unknown command '{}'\n", other),
     }
 }
@@ -167,7 +182,7 @@ fn cmd_send(state: &SharedState, args: &str) -> String {
         }
         format!("Sent {} byte(s) to {} user(s).\n", payload.len(), count)
     } else {
-        match sessions.get(&target.to_lowercase()) {
+        match sessions.get(target) {
             Some(conn) => {
                 conn.send(2, &payload, "TERMINAL_SEND");
                 format!("Sent {} byte(s) to {}.\n", payload.len(), target)
@@ -178,13 +193,15 @@ fn cmd_send(state: &SharedState, args: &str) -> String {
 }
 
 fn cmd_kick(state: &SharedState, args: &str) -> String {
-    let username = args.trim().to_lowercase();
-    if username.is_empty() {
+    let input = args.trim();
+    if input.is_empty() {
         return "[!] Usage: kick <username>\n".to_string();
     }
-    match state.sessions.read().unwrap().get(&username).map(Arc::clone) {
-        Some(conn) => { conn.disconnect(); format!("Kicked {}.\n", username) }
-        None       => format!("[!] '{}' is not online.\n", username),
+    // Resolve to canonical casing via DB, then look up in sessions.
+    let canonical = state.db.get_player(input).map(|p| p.username).unwrap_or_else(|| input.to_string());
+    match state.sessions.read().unwrap().get(&canonical).map(Arc::clone) {
+        Some(conn) => { conn.disconnect(); format!("Kicked {}.\n", canonical) }
+        None       => format!("[!] '{}' is not online.\n", canonical),
     }
 }
 
@@ -193,12 +210,12 @@ fn cmd_create(state: &SharedState, args: &str) -> String {
         Some(p) => p,
         None    => return "[!] Usage: create <username> <token>\n".to_string(),
     };
-    let user  = user_raw.trim().to_lowercase();
+    let user  = user_raw.trim();
     let token = token.trim();
     if user.is_empty() || token.is_empty() {
         return "[!] Usage: create <username> <token>\n".to_string();
     }
-    if state.db.create_player(&user, user_raw.trim(), token) {
+    if state.db.create_player(user, token) {
         format!("Created player '{}' with token '{}'.\n", user, token)
     } else {
         format!("[!] Username '{}' is already taken.\n", user)
@@ -206,7 +223,8 @@ fn cmd_create(state: &SharedState, args: &str) -> String {
 }
 
 fn cmd_delete(adm: &mut AdminSession, state: &SharedState, args: &str) -> String {
-    let username = args.trim().to_lowercase();
+    let input = args.trim();
+    let username = state.db.get_player(input).map(|p| p.username).unwrap_or_else(|| input.to_string());
     if username.is_empty() {
         return "[!] Usage: delete <username>\n".to_string();
     }
@@ -232,7 +250,7 @@ fn cmd_delete(adm: &mut AdminSession, state: &SharedState, args: &str) -> String
     let pkt = PushRemoved { username: Str16::new(&username) };
     let sessions = state.sessions.read().unwrap();
     let mut notified = 0usize;
-    for (friend, _) in &friends {
+    for friend in &friends {
         if let Some(conn) = sessions.get(friend.as_str()) {
             conn.send_pkt(&pkt, "S->C [PUSH_REMOVED] (delete)");
             notified += 1;
@@ -248,7 +266,8 @@ fn cmd_delete(adm: &mut AdminSession, state: &SharedState, args: &str) -> String
 }
 
 fn cmd_spoof(adm: &mut AdminSession, state: &SharedState, args: &str) -> String {
-    let username = args.trim().to_lowercase();
+    let input = args.trim();
+    let username = state.db.get_player(input).map(|p| p.username).unwrap_or_else(|| input.to_string());
     if username.is_empty() {
         return "[!] Usage: spoof <username>\n".to_string();
     }
@@ -329,6 +348,52 @@ fn cmd_reports(state: &SharedState) -> String {
         ));
     }
     out
+}
+
+fn cmd_help() -> String {
+    "\
+Commands:\n\
+  help                  — list all commands\n\
+  list                  — show online users and their IPs\n\
+  send <user|*> <hex>   — send a raw payload to one user or everyone\n\
+  kick <user>           — forcibly disconnect a user\n\
+  create <user> <token> — register a new player with an explicit token\n\
+  delete <user>         — delete a player (refused if online)\n\
+  spoof <user>          — inject a fake session for <user>\n\
+  unspoof               — tear down the active fake session\n\
+  recv <hex>            — feed a raw client packet to the spoofed user\n\
+  reports               — list all player reports\n\
+  db <base64-sql>       — run a raw SQL query against the database\n\
+  restart               — kill the server (systemd will restart it)\n\
+  exit                  — close this admin session\n\
+".to_string()
+}
+
+fn cmd_exit(adm: &mut AdminSession) -> String {
+    adm.exit = true;
+    String::new()
+}
+
+fn cmd_restart() -> String {
+    println!("[terminal] Restart requested — exiting.");
+    std::process::exit(1);
+}
+
+fn cmd_db(state: &SharedState, args: &str) -> String {
+    let b64 = args.trim();
+    if b64.is_empty() {
+        return "[!] Usage: db <base64-encoded-sql>\n".to_string();
+    }
+
+    let sql = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s)  => s,
+            Err(_) => return "[!] SQL is not valid UTF-8 after decoding.\n".to_string(),
+        },
+        Err(e) => return format!("[!] Base64 decode failed: {}\n", e),
+    };
+
+    state.db.run_sql(&sql)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
