@@ -161,7 +161,7 @@ pub fn handle_auto_accept(
             display:       Str16::new(&world_name),
             token:         Str16::new(&world_name),
             host_ip:       Str16::new(&ip),
-            mode:          Str16::new("P2P"),
+            mode:          Str16::new(&ip),  // fallback IP (same as primary)
             port,
             password_flag: 0x00,
         };

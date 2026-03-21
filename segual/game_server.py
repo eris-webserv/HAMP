@@ -64,6 +64,33 @@ CHUNK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"chunks_{R
 if IS_PUBLIC:
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
+# ── teleporter persistence ────────────────────────────────────────────────────
+TELEPORTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               f"teleporters_{ROOM_TOKEN}.json")
+SCREENSHOT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               f"screenshots_{ROOM_TOKEN}")
+if IS_PUBLIC:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+teleporters_lock = threading.Lock()
+
+def load_teleporters():
+    if os.path.exists(TELEPORTER_FILE):
+        try:
+            with open(TELEPORTER_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def save_teleporters(tele_list):
+    with open(TELEPORTER_FILE, 'w', encoding='utf-8') as f:
+        json.dump(tele_list, f, indent=2)
+
+def tele_key(custom_id, cx, cz, tx, tz):
+    """Unique key for a teleporter based on its custom_id and position."""
+    return f"{custom_id}_{cx}_{cz}_{tx}_{tz}"
+
 # ── host relay state (FRIEND/PRIVATE servers) ────────────────────────────────
 # host_player is already initialized from sys.argv at the top of the file
 host_lock    = threading.Lock()
@@ -155,7 +182,7 @@ WORLD_SEED = int(hashlib.md5(ROOM_TOKEN.encode()).hexdigest()[:8], 16)
 
 # ── Catalogue mode ───────────────────────────────────────────────────────────
 # When enabled, dedicated chunks at (x=50..61, z=0) contain every buildable item
-CATALOGUE_ENABLED = False
+CATALOGUE_ENABLED = True
 
 # Cache of generated biomes: (x, z) → biome_id
 biome_cache = {}
@@ -392,90 +419,10 @@ CATALOGUE_ITEMS = [
     ("Park Bench",2), ("Pool Table",2), ("Pop-up Saw",2), ("Trading Table",2),
 ]
 
-# Pre-generate catalogue chunk layouts (chunk_offset → list of build dicts)
-CATALOGUE_ORIGIN_X = 50  # catalogue chunks start at x=50, z=0
-catalogue_cache = {}
-
 def _generate_catalogue_chunks():
-    """Pre-layout all catalogue items across chunks at (CATALOGUE_ORIGIN_X+n, 0)."""
-    if not CATALOGUE_ENABLED:
-        return
-
-    # Sort items by size (large first) so they get placed before space runs out
-    # Within each size group, keep original order
-    items_1 = [(n, s) for n, s in CATALOGUE_ITEMS if s == 1]
-    items_2 = [(n, s) for n, s in CATALOGUE_ITEMS if s == 2]
-    items_3 = [(n, s) for n, s in CATALOGUE_ITEMS if s == 3]
-    items_5 = [(n, s) for n, s in CATALOGUE_ITEMS if s >= 5]
-
-    # Place large items first in their own chunks, then smaller ones
-    all_sorted = items_5 + items_3 + items_2 + items_1
-    placed_count = 0
-
-    # Simple grid placement: each chunk is 10x10 tiles
-    chunk_offset = 0
-    builds = []
-    occupied = set()
-    cursor_x, cursor_z = 0, 0
-    row_height = 1  # track tallest item in current row
-
-    for item_name, size in all_sorted:
-        # Try to fit item at cursor position
-        fits = False
-        while not fits:
-            if cursor_x + size > 10:
-                # Next row
-                cursor_x = 0
-                cursor_z += row_height
-                row_height = size
-            if cursor_z + size > 10:
-                # Chunk full, start new chunk
-                catalogue_cache[(CATALOGUE_ORIGIN_X + chunk_offset, 0)] = builds
-                chunk_offset += 1
-                builds = []
-                occupied = set()
-                cursor_x, cursor_z = 0, 0
-                row_height = size
-
-            needed = {(cursor_x + dx, cursor_z + dz) for dx in range(size) for dz in range(size)}
-            if not needed & occupied and all(t < 10 for _, t in needed) and all(t < 10 for t, _ in needed):
-                occupied |= needed
-                cx = CATALOGUE_ORIGIN_X + chunk_offset
-                item_bytes = pack_item(item_name)
-                builds.append({
-                    "item_hex": item_bytes.hex(),
-                    "rotation": 0,
-                    "tile_x": cursor_x,
-                    "tile_z": cursor_z,
-                    "pos": [cx, 0, cursor_x, cursor_z],
-                    "owner": "",
-                    "zone": "overworld"
-                })
-                placed_count += 1
-                cursor_x += size
-                if size > row_height:
-                    row_height = size
-                fits = True
-            else:
-                cursor_x += 1
-                if cursor_x + size > 10:
-                    cursor_x = 0
-                    cursor_z += row_height
-                    row_height = size
-                if cursor_z + size > 10:
-                    catalogue_cache[(CATALOGUE_ORIGIN_X + chunk_offset, 0)] = builds
-                    chunk_offset += 1
-                    builds = []
-                    occupied = set()
-                    cursor_x, cursor_z = 0, 0
-                    row_height = size
-
-    # Save last chunk
-    if builds:
-        catalogue_cache[(CATALOGUE_ORIGIN_X + chunk_offset, 0)] = builds
-        chunk_offset += 1
-
-    print(f"[CATALOGUE] Generated {chunk_offset} catalogue chunks with {placed_count} items (x={CATALOGUE_ORIGIN_X}..{CATALOGUE_ORIGIN_X + chunk_offset - 1}, z=0)")
+    """No-op — catalogue items are generated per-chunk in generate_chunk_objects."""
+    if CATALOGUE_ENABLED:
+        print(f"[CATALOGUE] Catalogue mode ON — every chunk spawns random buildable items ({len(CATALOGUE_ITEMS)} item types)")
 
 # Cache of generated chunk objects: (x, z) → list of build dicts
 worldgen_cache = {}
@@ -490,12 +437,29 @@ def generate_chunk_objects(cx, cz, biome_id):
     # Seeded RNG for this chunk
     rng = random.Random(WORLD_SEED ^ (cx * 73856093) ^ (cz * 19349669))
 
+    if CATALOGUE_ENABLED:
+        # Catalogue mode: fill every other tile with a random buildable item (all 1x1)
+        builds = []
+        for tz in range(0, 10, 2):
+            for tx in range(0, 10, 2):
+                item_name, _size = rng.choice(CATALOGUE_ITEMS)
+                item_bytes = pack_item(item_name)
+                builds.append({
+                    "item_hex": item_bytes.hex(),
+                    "rotation": rng.randint(0, 3),
+                    "tile_x": tx,
+                    "tile_z": tz,
+                    "pos": [cx, cz, tx, tz],
+                    "owner": "",
+                    "zone": "overworld"
+                })
+
+        with worldgen_cache_lock:
+            worldgen_cache[(cx, cz)] = builds
+        return builds
+
     objects = BIOME_OBJECTS.get(biome_id, BIOME_OBJECTS[BIOME_GRASS])
-
-    # Determine how many objects to place (3-8 per chunk)
     num_objects = rng.randint(3, 8)
-
-    # Build weighted selection list
     pool = []
     for item_name, weight, size in objects:
         pool.extend([(item_name, size)] * weight)
@@ -513,14 +477,10 @@ def generate_chunk_objects(cx, cz, biome_id):
         # Try to find a free spot (up to 10 attempts)
         placed = False
         for _attempt in range(10):
-            if size == 2:
-                tx = rng.randint(0, 8)  # 2x2 needs room
-                tz = rng.randint(0, 8)
-                tiles = {(tx, tz), (tx+1, tz), (tx, tz+1), (tx+1, tz+1)}
-            else:
-                tx = rng.randint(0, 9)
-                tz = rng.randint(0, 9)
-                tiles = {(tx, tz)}
+            max_pos = max(0, 10 - size)
+            tx = rng.randint(0, max_pos)
+            tz = rng.randint(0, max_pos)
+            tiles = {(tx + dx, tz + dz) for dx in range(size) for dz in range(size)}
 
             if not tiles & occupied:
                 occupied |= tiles
@@ -753,8 +713,8 @@ SRV_PLAYER_GONE     = 0x13  # S2C case 0x13 flag=0: NearbyPlayerWentAway (remove
 SRV_PONG            = 0x01
 SRV_CHAT            = 0x06
 SRV_LOGIN_OUT_NOTIF = 0x1e
-SRV_TELEPORT_START  = 0x0c
-SRV_TELEPORT_END    = 0x00
+SRV_TELEPORT_START  = 0x15
+SRV_TELEPORT_END    = 0x16
 SRV_JOIN_CONFIRMED  = 0x02
 SRV_EQUIP_CHANGE    = 0x23
 SRV_POSITION        = 0x11
@@ -1058,6 +1018,19 @@ def dispatch(conn, addr, data, pid, username, name, conn_state):
     elif pid == 0x14: # ZONE_CHANGE
         zone_name, off = unpack_string(data, 10)
         print(f"  zone={zone_name!r}")
+        if username:
+            # Update stored initial_data zone so late-joiners see correct zone
+            with players_lock:
+                p = players.get(username)
+                if p and p['initial_data']:
+                    od = p['initial_data']
+                    # initial_data layout: pos(8) + pos(8) + stats(8) + appearance(1) + String(zone) + ...
+                    z_off = 8 + 8 + 8 + 1  # 25
+                    old_zone, after_zone = unpack_string(od, z_off)
+                    new_od = od[:z_off] + pack_string(zone_name) + od[after_zone:]
+                    p['initial_data'] = new_od
+            broadcast(bytes([0x14]) + pack_string(username) + pack_string(zone_name),
+                      exclude=username, label="BCAST_ZONE_CHANGE")
 
     elif pid == 0x0a: # REQ_ZONE_DATA
         zone_name, off = unpack_string(data, 10)
@@ -1111,19 +1084,14 @@ def dispatch(conn, addr, data, pid, username, name, conn_state):
                     save_chunk_data(x, z, cd)
                 player_builds = cd.get("builds", [])
 
-                # Generate natural world objects and merge with player builds
+                # Generate natural/catalogue world objects and merge with player builds
                 biome_id = get_biome(x, z)
                 natural = generate_chunk_objects(x, z, biome_id)
-
-                # Catalogue chunks (if enabled)
-                cat_builds = catalogue_cache.get((x, z), []) if CATALOGUE_ENABLED else []
-
-                all_builds = natural + cat_builds + player_builds
+                all_builds = natural + player_builds
 
                 send_packet(conn, 2, make_dummy_chunk(x, z, zone_name, dimension_type, sub_zone, all_builds), "CHUNK_RESP")
                 if all_builds:
-                    cat_str = f" catalogue={len(cat_builds)}" if cat_builds else ""
-                    print(f"  [CHUNK] Served chunk x={x} z={z} biome={biome_id} natural={len(natural)} player={len(player_builds)}{cat_str}")
+                    print(f"  [CHUNK] Served chunk x={x} z={z} biome={biome_id} natural={len(natural)} player={len(player_builds)}")
             else:
                 # ── FRIEND mode: relay chunk request to the HOST ─────────
                 # The host's OnReceive case 0x0C expects:
@@ -1182,9 +1150,9 @@ def dispatch(conn, addr, data, pid, username, name, conn_state):
             broadcast(chat_payload, label="RELAY_CHAT")
 
     elif pid == 0x15: # TELE_START
-        tele_name, _ = unpack_string(data, 10)
+        # S2C 0x15: String(username) → client calls StartTeleportPlayer
         if username:
-            broadcast(bytes([SRV_TELEPORT_START]) + pack_string(username) + pack_string(tele_name),
+            broadcast(bytes([SRV_TELEPORT_START]) + pack_string(username),
                       exclude=username, label="BCAST_TELE_START")
 
     elif pid == 0x20: # BUILD_FURNITURE
@@ -1253,6 +1221,17 @@ def dispatch(conn, addr, data, pid, username, name, conn_state):
                 cd["builds"] = [b for b in cd["builds"] if b.get("pos") != pos]
                 save_chunk_data(cx, cz, cd)
                 print(f"  [REMOVE] Updated chunk x{cx} z{cz}, remaining builds: {len(cd['builds'])}")
+
+                # Also remove any teleporter at this position
+                with teleporters_lock:
+                    tlist = load_teleporters()
+                    before = len(tlist)
+                    tlist = [t for t in tlist if not (
+                        t.get("cx") == cx and t.get("cz") == cz and
+                        t.get("tx") == pos[2] and t.get("tz") == pos[3])]
+                    if len(tlist) < before:
+                        save_teleporters(tlist)
+                        print(f"  [TELE] Removed teleporter at ({cx},{cz},{pos[2]},{pos[3]})")
 
     elif pid == 0x22: # REPLACE_BUILDABLE
         # C2S: Byte(0x22) + String(validator) + Item(old) + Item(new) + Byte(rot) + String(zone) + Short×4 + String(extra)
@@ -1739,8 +1718,138 @@ def dispatch(conn, addr, data, pid, username, name, conn_state):
         if username:
             broadcast(bytes([pid]) + pack_string(username) + data[10:], exclude=username, label=f"RELAY_{pname}")
 
+    elif pid == 0x16: # END_TELEPORT
+        # S2C 0x16: String(username) + Short×4(position) → EndTeleportPlayer
+        # C2S sends raw position data at data[10:] which is Short×4 (cx, cz, tx, tz)
+        if username:
+            # Update stored position in initial_data so late-joiners see correct location
+            new_pos = data[10:18]  # 4 shorts = 8 bytes
+            if len(new_pos) == 8:
+                with players_lock:
+                    p = players.get(username)
+                    if p and p['initial_data']:
+                        od = p['initial_data']
+                        # initial_data layout: pos(8) + pos(8) + rest...
+                        # Both pos slots get the same new position
+                        p['initial_data'] = new_pos + new_pos + od[16:]
+            broadcast(bytes([SRV_TELEPORT_END]) + pack_string(username) + data[10:],
+                      exclude=username, label="BCAST_TELE_END")
+
+    elif pid == 0x2e: # REQ_TELE_PAGE
+        # C2S mode 0: Byte(0x2E) + Byte(0) + Byte(?) + Short(page)   — no validator
+        # C2S mode 1: Byte(0x2E) + Byte(1) + String(search) + Short×4 — no validator
+        if username:
+            off = 10
+            mode = data[off]; off += 1
+            page = 0
+            if mode == 0:
+                off += 1  # skip extra byte (param_3 in client sender)
+                if off + 2 <= total_len:
+                    page = struct.unpack_from('<h', data, off)[0]; off += 2
+            elif mode == 1:
+                # Search mode: String(search) + Short×4 — find which page contains matching tele
+                search_str, off = unpack_string(data, off)
+                s_cx = struct.unpack_from('<h', data, off)[0]; off += 2
+                s_cz = struct.unpack_from('<h', data, off)[0]; off += 2
+                s_tx = struct.unpack_from('<h', data, off)[0]; off += 2
+                s_tz = struct.unpack_from('<h', data, off)[0]; off += 2
+                # Find which page this teleporter falls on
+                with teleporters_lock:
+                    tlist = load_teleporters()
+                for idx, t in enumerate(tlist):
+                    if (t.get("custom_id","") == search_str and
+                        t.get("cx") == s_cx and t.get("cz") == s_cz and
+                        t.get("tx") == s_tx and t.get("tz") == s_tz):
+                        page = idx // 3
+                        break
+
+            # Build S2C 0x2F response
+            with teleporters_lock:
+                tlist = load_teleporters()
+
+            # Clamp page to valid range
+            max_page = max(0, (len(tlist) - 1) // 3) if tlist else 0
+            page = max(0, min(page, max_page))
+            start = page * 3
+            has_prev = 1 if page > 0 else 0
+            has_next = 1 if start + 3 < len(tlist) else 0
+
+            resp = bytes([0x2f])
+            resp += struct.pack('<h', page)
+            resp += bytes([has_prev, has_next])
+            for slot in range(3):
+                idx = start + slot
+                if 0 <= idx < len(tlist):
+                    t = tlist[idx]
+                    resp += bytes([1])  # active
+                    resp += pack_string(t.get("name", ""))
+                    resp += pack_string(t.get("desc", ""))
+                    resp += pack_string(t.get("location", ""))
+                    resp += pack_string(t.get("custom_id", ""))
+                    resp += struct.pack('<hhhh', t.get("cx",0), t.get("cz",0),
+                                                t.get("tx",0), t.get("tz",0))
+                    resp += pack_string(t.get("owner", ""))
+                else:
+                    resp += bytes([0])  # inactive slot
+
+            send_packet(conn, 2, resp, "TELE_PAGE_RESPONSE")
+
+    elif pid == 0x32: # TELE_SCREENSHOT_DATA — absorb silently, no image forwarding for now
+        pass
+
+    elif pid == 0x33: # FINISH_TELE_EDIT
+        # C2S: Byte(0x33) + String(name) + String(desc) + String(custom_id) + Short×4 — no validator
+        if username:
+            off = 10
+            tname, off = unpack_string(data, off)
+            tdesc, off = unpack_string(data, off)
+            tcustom, off = unpack_string(data, off)
+            tcx = struct.unpack_from('<h', data, off)[0]; off += 2
+            tcz = struct.unpack_from('<h', data, off)[0]; off += 2
+            ttx = struct.unpack_from('<h', data, off)[0]; off += 2
+            ttz = struct.unpack_from('<h', data, off)[0]; off += 2
+
+            # Build location string from position
+            tlocation = f"{tcustom}"
+
+            entry = {
+                "name": tname, "desc": tdesc, "custom_id": tcustom,
+                "location": tlocation, "owner": username,
+                "cx": tcx, "cz": tcz, "tx": ttx, "tz": ttz
+            }
+
+            with teleporters_lock:
+                tlist = load_teleporters()
+                # Update existing or add new
+                found = False
+                for i, t in enumerate(tlist):
+                    if (t.get("custom_id") == tcustom and
+                        t.get("cx") == tcx and t.get("cz") == tcz and
+                        t.get("tx") == ttx and t.get("tz") == ttz):
+                        tlist[i] = entry
+                        found = True
+                        break
+                if not found:
+                    tlist.append(entry)
+                save_teleporters(tlist)
+
+            print(f"  [TELE] Saved teleporter '{tname}' at ({tcx},{tcz},{ttx},{ttz}) by {username}")
+
+            # Broadcast S2C 0x33 to other players so they update locally
+            s2c = bytes([0x33])
+            s2c += pack_string(tname) + pack_string(tdesc) + pack_string(tcustom)
+            s2c += struct.pack('<hhhh', tcx, tcz, ttx, ttz)
+            broadcast(s2c, exclude=username, label="BCAST_TELE_EDIT")
+
+    elif pid in (0x30, 0x31, 0x4F, 0xDE, 0xEA): # Screenshot packets (0x30=send, 0x31=req, 0x4F/0xDE/0xEA=fragment continuations)
+        # Absorb silently — no image forwarding for now to avoid client crashes
+        pass
+
+    elif pid == 0x34: # NEW_TELE_SEARCH — client-side only, no server action needed
+        pass
+
     # ── Non-validator packets: prepend username as sender ─────────────────
-    elif pid in (0x16, 0x18, 0x19, 0x23, 0x4a, 0x4b, 0x53, 0x09, 0x56):
+    elif pid in (0x18, 0x19, 0x23, 0x4a, 0x4b, 0x53, 0x09, 0x56):
         if username:
             broadcast(bytes([pid]) + pack_string(username) + data[10:], exclude=username, label=f"BCAST_{pname}")
 
@@ -1769,7 +1878,10 @@ def dispatch(conn, addr, data, pid, username, name, conn_state):
         send_packet(conn, 2, b'\x0F', "HB")
 
     else:
-        if username:
+        payload_size = total_len - 10
+        if payload_size > 512:
+            print(f"  [DROP] Unhandled pid 0x{pid:02X} has large payload ({payload_size}B) — not broadcasting")
+        elif username:
             broadcast(bytes([pid]) + pack_string(username) + data[10:], exclude=username, label=f"RELAY_{name}")
         else:
             hd = binascii.hexlify(data[9:min(len(data), 32)]).decode()

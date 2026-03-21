@@ -10,7 +10,7 @@ DB_FILE = 'players.json'
 # Set FORCE_LOCAL_IP to an empty string to use your public IP (requires port forwarding).
 # Set it to '127.0.0.1' for same-machine testing, or your LAN IP (e.g. '192.168.1.x')
 # for clients on the same local network.
-FORCE_LOCAL_IP = 'put ur ip here'
+FORCE_LOCAL_IP = 'put ur ip in here'
 
 if FORCE_LOCAL_IP:
     RELAY_IP = FORCE_LOCAL_IP
@@ -73,7 +73,7 @@ def craft_batch(qid, payload):
 
 active_sessions = {} # user_low -> (conn, addr)
 world_states = {}
-DEFAULT_WORLD = b'\x01\x00\x00\x00\x00\x00\x00'
+DEFAULT_WORLD = b'\x01\x00\x00\x00\x00'  # Byte(1) + String("") + Short(0)
 active_game_servers = {} # user_low -> dyn_port (tracks which game server a user is in) 
 
 def send_packet(conn, qid, payload, label="UNKNOWN"):
@@ -120,15 +120,13 @@ def handle_client(conn, addr):
                     
                     send_packet(conn, 2, resp + struct.pack('<H H B HH', 0, 10, 0, 0, 0), "LOGIN_SUCCESS")
 
+                    # Notify online friends that this user came online
                     my_world = world_states.get(current_user, DEFAULT_WORLD)
                     for f in friends_list:
                         f_low = f.lower()
                         if f_low in active_sessions:
                             f_conn = active_sessions[f_low][0]
-                            send_packet(conn, 2, b'\x16' + pack_string(f_low) + world_states.get(f_low, DEFAULT_WORLD), "SYNC_ONLINE_FRIEND")
                             send_packet(f_conn, 2, b'\x16' + pack_string(current_user) + my_world, "NOTIFY_FRIEND_ONLINE")
-                        else:
-                            send_packet(conn, 2, b'\x17' + pack_string(f_low), "SYNC_OFFLINE_FRIEND")
 
             elif packet_id == 0x10: # ADD FRIEND
                 raw_t, _ = unpack_string(data, 10); t = raw_t.lower()
@@ -216,8 +214,17 @@ def handle_client(conn, addr):
                     send_packet(conn, 2, jump, "JUMP_HOST")
 
             elif packet_id == 0x2C: # WORLD_UPDATE
-                total_len = struct.unpack('<H', data[0:2])[0]
-                world_states[current_user] = data[10:total_len]
+                # Client sends PackWorldString: Byte + String + String + Short (4 fields)
+                # Client reads UnpackWorldString: Byte + String + Short (3 fields)
+                # We must strip the second String so the stored state matches what readers expect.
+                off = 10
+                wb = data[off:off+1]; off += 1                          # Byte (world type)
+                ws1_len = struct.unpack('<H', data[off:off+2])[0]       # first String
+                ws1 = data[off:off+2+ws1_len]; off += 2 + ws1_len
+                ws2_len = struct.unpack('<H', data[off:off+2])[0]       # second String (skip)
+                off += 2 + ws2_len
+                wp = data[off:off+2]                                    # Short (port)
+                world_states[current_user] = wb + ws1 + wp              # repack as 3 fields
             
             elif packet_id == 0x0F: send_packet(conn, 2, b'\x0F', "HB")
     except Exception as e: print(f"[!] handle_client error: {e}")

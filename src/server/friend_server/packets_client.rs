@@ -61,20 +61,21 @@ pub enum ClientPacket {
         message: String,
     },
 
-    /// `0x2B` — host grants (`status = 1`) or denies (`status = 0`) a join
-    /// request that was relayed through the server.
+    /// `0x2B` — host grants a join request relayed through the server.
+    /// C→S wire format is just `[target: Str16]` — no status or room fields.
     JoinGrant {
-        /// Lowercase target (the player who requested to join).
-        target:    String,
-        status:    u8,
-        /// Room identifier included by the host when granting access.
-        /// May be absent even on `status = 1` if the client omitted it.
-        room_name: Option<String>,
+        target: String,
     },
 
     /// `0x2C` — client broadcasts its current in-game / lobby world state.
+    ///
+    /// The raw blob uses PackWorldString format (4 fields):
+    ///   Byte + String + String + Short
+    /// Before storing, the handler must strip the second String to produce
+    /// the 3-field UnpackWorldString format that readers expect.
+    /// See `strip_world_update`.
     WorldUpdate {
-        /// Raw blob bounded by the batch header's `total_len` field.
+        /// Raw 4-field blob bounded by the batch header's `total_len` field.
         world_data: Vec<u8>,
     },
 
@@ -169,19 +170,11 @@ impl ClientPacket {
             }
 
             // ── JOIN_GRANT (0x2B) ─────────────────────────────────────────
-            // C→S  [target: Str16] [status: u8] [room_name: Str16]?
-            //
-            // room_name is present only when status == 1, and is optional
-            // even then — parse it when the bytes are there, otherwise None.
+            // C→S  [target: Str16]
+            // The client sends only the target username — no status byte.
             0x2B => {
                 let target = Str16::read(&mut cur).ok()?;
-                let status: u8 = cur.read_le().ok()?;
-                let room_name = if status == 1 {
-                    Str16::read(&mut cur).ok().map(|s| s.value)
-                } else {
-                    None
-                };
-                Some(Self::JoinGrant { target: target.value, status, room_name })
+                Some(Self::JoinGrant { target: target.value })
             }
 
             // ── WORLD_UPDATE (0x2C) ───────────────────────────────────────

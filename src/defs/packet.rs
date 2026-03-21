@@ -15,12 +15,18 @@ use binrw::{binrw, BinRead, BinWrite};
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /// "In Personal World" world-state blob.
-/// Layout: u8(menu_id=1), then 6 zero bytes for room/count fields.
-pub const DEFAULT_WORLD: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-
-/// "Online, not in a world" world-state blob.
-/// menu_id=0 shows the player as online without a location label.
-pub const IDLE_WORLD: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// Default world state blob (3-field UnpackWorldString format).
+///
+/// World state has TWO wire formats:
+///   PackWorldString   (C→S in 0x2C): Byte + String + String + Short  (4 fields)
+///   UnpackWorldString (S→C in login/0x16): Byte + String + Short     (3 fields)
+///
+/// The second String in PackWorldString is NOT read by UnpackWorldString.
+/// We always store and transmit the 3-field version. The WorldUpdate (0x2C)
+/// handler strips the extra String before storing (see `strip_world_update`).
+///
+/// This constant = Byte(0x01) + String("") + Short(0) = 5 bytes.
+pub const DEFAULT_WORLD: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x00];
 
 /// Fixed footer appended to every LOGIN_SUCCESS response.
 ///

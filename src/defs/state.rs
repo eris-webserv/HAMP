@@ -130,11 +130,10 @@ impl SharedState {
 
         let payload: Vec<u8> = if online {
             let worlds = self.world_states.read().unwrap();
-            let fallback = vec![0x00u8];
             let world = worlds
                 .get(username)
                 .map(|w| w.as_slice())
-                .unwrap_or(&fallback);
+                .unwrap_or(crate::defs::packet::DEFAULT_WORLD);
             FriendOnline {
                 username:   Str16::new(username),
                 world_data: world.to_vec(),

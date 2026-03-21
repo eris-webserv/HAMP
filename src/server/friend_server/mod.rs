@@ -26,14 +26,71 @@ fn random_token() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 12)
 }
 
+/// Strip the second String from a WorldUpdate blob.
+///
+/// PackWorldString (C→S): `Byte + String₁ + String₂ + Short`
+/// UnpackWorldString (read): `Byte + String₁ + Short`
+///
+/// Returns the 3-field version: `Byte + String₁ + Short`.
+fn strip_world_update(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return crate::defs::packet::DEFAULT_WORLD.to_vec();
+    }
+    let mut off = 0;
+    // Byte (world type)
+    let wb = data[off..off + 1].to_vec();
+    off += 1;
+    // String₁ (length-prefixed UTF-16LE)
+    if off + 2 > data.len() { return crate::defs::packet::DEFAULT_WORLD.to_vec(); }
+    let s1_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+    let s1 = data[off..off + 2 + s1_len].to_vec();
+    off += 2 + s1_len;
+    // String₂ — skip
+    if off + 2 > data.len() { return crate::defs::packet::DEFAULT_WORLD.to_vec(); }
+    let s2_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+    off += 2 + s2_len;
+    // Short (port)
+    if off + 2 > data.len() { return crate::defs::packet::DEFAULT_WORLD.to_vec(); }
+    let wp = data[off..off + 2].to_vec();
+    // Repack as 3 fields
+    let mut out = wb;
+    out.extend_from_slice(&s1);
+    out.extend_from_slice(&wp);
+    out
+}
+
 // ── Login response builder ─────────────────────────────────────────────────
 //
-// The LOGIN_SUCCESS payload is variable-length (friend/pending lists) and
-// doesn't map cleanly to a single binrw struct, so we build it manually
-// using `pack_string` for the UTF-16LE fields.
+// S→C 0x0B LOGIN_SUCCESS wire layout:
+//
+//   u8   packet_id       = 0x0B
+//   u8   success         = 0x01
+//   u16  friend_count
+//   for each friend:
+//     Str16  username
+//     Str16  display
+//     u8     is_online
+//     if is_online == 1:
+//       [world_data]     — 3-field UnpackWorldString blob (variable length)
+//     else:
+//       u8  0x00         — menu_id=0, no further world fields
+//   u16  outbound_pending_count     (requests YOU sent)
+//   for each outbound:
+//     Str16  username
+//     Str16  display
+//   u16  inbound_pending_count      (requests sent TO you)
+//   for each inbound:
+//     Str16  username
+//     Str16  display
+//   --- trailer (9 bytes) ---
+//   i16  N_ToPing          = 0
+//   i16  give_gems_on_open = 0   (set to 10 to award gems)
+//   u8   show_warning      = 0
+//   i16  unknown           = 0
+//   i16  N_trophies        = 0
 
 fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
-    let mut resp = vec![0x0B, 0x01]; // packet-ID, success byte
+    let mut resp = vec![0x0B, 0x01];
 
     let sessions = state.sessions.read().unwrap();
     let worlds   = state.world_states.read().unwrap();
@@ -47,17 +104,16 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
         resp.extend_from_slice(&pack_string(f_user));
         resp.extend_from_slice(&pack_string(f_user)); // username = display
         resp.push(is_on as u8);
-        if is_on && world.is_some() {
-            resp.extend_from_slice(world.unwrap());
+        if is_on {
+            let w = world.map(|w| w.as_slice())
+                     .unwrap_or(crate::defs::packet::DEFAULT_WORLD);
+            resp.extend_from_slice(w);
         } else {
-            // Offline, or online with no WorldUpdate yet — single 0x00 byte
-            // (menu_id=0, no trailing fields). Sending more bytes here would
-            // misalign the parser and corrupt subsequent friend entries.
             resp.push(0x00);
         }
     }
 
-    // ── Outbound pending requests (status=2: you sent them a request) ─────
+    // ── Outbound pending (you sent them a request) ─────────────────────────
     let outbound = state.db.get_pending_outbound(username);
     resp.extend_from_slice(&(outbound.len() as u16).to_le_bytes());
     for u in &outbound {
@@ -65,7 +121,7 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
         resp.extend_from_slice(&pack_string(u));
     }
 
-    // ── Inbound pending requests (status=3: they sent you a request) ──────
+    // ── Inbound pending (they sent you a request) ──────────────────────────
     let inbound = state.db.get_pending_inbound(username);
     resp.extend_from_slice(&(inbound.len() as u16).to_le_bytes());
     for u in &inbound {
@@ -73,7 +129,7 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
         resp.extend_from_slice(&pack_string(u));
     }
 
-    // ── Fixed trailer: N_ToPing(0) give_gems(0) warn(0) unk(0) N_trophy(0) ─
+    // ── Trailer ────────────────────────────────────────────────────────────
     resp.extend_from_slice(crate::defs::packet::LOGIN_SUCCESS_TRAILER);
     resp
 }
@@ -135,6 +191,26 @@ pub fn handle_packet(
 
                 let resp = build_login_success(&canonical, state);
                 conn.send(2, &resp, "S->C [LOGIN_SUCCESS]");
+
+                // After login, send 0x16 sync for each online friend (matches Python).
+                // This ensures the client reinitialises friend state on reconnection.
+                {
+                    let sessions = state.sessions.read().unwrap();
+                    let worlds   = state.world_states.read().unwrap();
+                    let friends  = state.db.get_friends(&canonical);
+                    for f in &friends {
+                        if sessions.contains_key(f.as_str()) {
+                            let w = worlds.get(f.as_str())
+                                .map(|v| v.as_slice())
+                                .unwrap_or(crate::defs::packet::DEFAULT_WORLD);
+                            let pkt = FriendOnline {
+                                username:   Str16::new(f),
+                                world_data: w.to_vec(),
+                            };
+                            conn.send_pkt(&pkt, "S->C [SYNC_ONLINE_FRIEND]");
+                        }
+                    }
+                }
             } else {
                 conn.send_pkt(&AuthFail, "S->C [AUTH_FAIL]");
             }
@@ -207,7 +283,8 @@ pub fn handle_packet(
 
                     // Confirm to acceptor.
                     let world_t = if is_on_t {
-                        worlds.get(&t).cloned().unwrap_or_else(|| vec![0x00])
+                        worlds.get(&t).cloned()
+                            .unwrap_or_else(|| crate::defs::packet::DEFAULT_WORLD.to_vec())
                     } else {
                         vec![0x00]
                     };
@@ -223,7 +300,7 @@ pub fn handle_packet(
                     if let Some(tc) = sessions.get(&t).map(Arc::clone) {
                         let world_u = worlds.get(user.as_str())
                             .cloned()
-                            .unwrap_or_else(|| vec![0x00]);
+                            .unwrap_or_else(|| crate::defs::packet::DEFAULT_WORLD.to_vec());
 
                         // Notify requester they were accepted.
                         tc.send_pkt(
@@ -353,7 +430,7 @@ pub fn handle_packet(
         //   1. Send empty 0x2B to HOST  → clears the "Allowing…" popup.
         //   2. Send empty 0x2B to JOINER → unfreezes the joiner's UI.
         //   3. Send 0x25 JUMP to JOINER  → triggers the P2P handoff.
-        ClientPacket::JoinGrant { target: target_raw, status, room_name } => {
+        ClientPacket::JoinGrant { target: target_raw } => {
             if let Some(ref user) = *current_user {
                 let t = state.db.get_player(&target_raw)
                     .map(|p| p.username)
@@ -370,23 +447,21 @@ pub fn handle_packet(
                     // 2. Unfreeze the joiner.
                     tc.send_pkt(&JoinGrantHostClear, "S->C [JOINER_UI_UNFREEZE]");
 
-                    // 3. Spawn a server-side game session and redirect both players.
-                    if status == 1 {
-                        let room = room_name.unwrap_or_else(|| user.clone());
-                        let ip   = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
+                    // 3. Spawn a relay session and redirect both players.
+                    let room = user.clone();
+                    let ip   = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
 
-                        if let Some(port) = game_server::spawn_relay_session(room.clone(), cfg) {
-                            let jump = JumpToGame {
-                                display:       Str16::new(user),
-                                token:         Str16::new(&room),
-                                host_ip:       Str16::new(ip),
-                                mode:          Str16::new("P2P"),
-                                port,
-                                password_flag: 0x00,
-                            };
-                            tc.send_pkt(&jump, "S->C [JUMP_SIGNAL_JOINER]");
-                            conn.send_pkt(&jump, "S->C [JUMP_SIGNAL_HOST]");
-                        }
+                    if let Some(port) = game_server::spawn_relay_session(room.clone(), cfg) {
+                        let jump = JumpToGame {
+                            display:       Str16::new(user),
+                            token:         Str16::new(&room),
+                            host_ip:       Str16::new(ip),
+                            mode:          Str16::new(ip),  // fallback IP (same as primary)
+                            port,
+                            password_flag: 0x00,
+                        };
+                        tc.send_pkt(&jump, "S->C [JUMP_SIGNAL_JOINER]");
+                        conn.send_pkt(&jump, "S->C [JUMP_SIGNAL_HOST]");
                     }
                 }
             }
@@ -409,12 +484,18 @@ pub fn handle_packet(
         }
 
         // ── WORLD UPDATE (0x2C) ────────────────────────────────────────────
-        // Stores the client's current world state and broadcasts FR_ONLINE
-        // to all online friends (so their location text updates live).
+        // The client's PackWorldString sends 4 fields:
+        //   Byte + String + String + Short
+        // But UnpackWorldString (used when reading world state in login
+        // responses and 0x16 notifications) only reads 3 fields:
+        //   Byte + String + Short
+        // We must strip the second String before storing so the blob can
+        // be injected directly into outgoing packets.
         ClientPacket::WorldUpdate { world_data } => {
             if let Some(ref user) = *current_user {
+                let stripped = strip_world_update(&world_data);
                 state.world_states.write().unwrap()
-                    .insert(user.clone(), world_data);
+                    .insert(user.clone(), stripped);
                 state.broadcast_status(user, true);
             }
         }
