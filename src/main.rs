@@ -1,4 +1,7 @@
 // main.rs — entry point.
+//
+// Default: starts a standalone game server.
+// With --frsv: starts the friend server + admin terminal instead.
 
 mod defs;
 mod server;
@@ -10,6 +13,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = utils::config::load();
     let args: Vec<String> = std::env::args().collect();
 
+    if args.iter().any(|a| a == "--frsv") {
+        run_friend_server(cfg)
+    } else {
+        run_game_server(cfg)
+    }
+}
+
+fn run_game_server(cfg: utils::config::Config) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== GAME SERVER ===");
+    println!("  Port: {}", cfg.game_port);
+    server::game_server::run(&cfg);
+    Ok(())
+}
+
+fn run_friend_server(cfg: utils::config::Config) -> Result<(), Box<dyn std::error::Error>> {
     let exe_dir = std::env::current_exe()?
         .parent()
         .ok_or("executable has no parent directory")?
@@ -21,6 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_str()
             .ok_or("db path is not valid UTF-8")?,
     )?;
+
+    // Clean up stale pending requests (friends who still have a pending row).
+    let cleaned = db.cleanup_stale_pending();
+    if cleaned > 0 {
+        println!("[DB] Cleaned {} stale pending request(s)", cleaned);
+    }
 
     let state = defs::state::SharedState::new(db);
 

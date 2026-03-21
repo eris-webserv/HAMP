@@ -195,6 +195,22 @@ impl Db {
         ).unwrap_or(0);
     }
 
+    // ── Maintenance ───────────────────────────────────────────────────────
+
+    /// Deletes any pending request where the two users are already friends.
+    /// Returns the number of stale rows removed.
+    pub fn cleanup_stale_pending(&self) -> usize {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending WHERE EXISTS (
+                SELECT 1 FROM friends
+                WHERE friends.user_a = pending.from_user
+                  AND friends.user_b = pending.to_user
+            )",
+            [],
+        ).unwrap_or(0)
+    }
+
     // ── Raw SQL (admin terminal) ───────────────────────────────────────────
 
     /// Executes an arbitrary SQL statement and returns results as a

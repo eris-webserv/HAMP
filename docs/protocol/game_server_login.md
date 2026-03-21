@@ -28,11 +28,34 @@ Client                          Server
   |<-- S→C 0x11 POSITION (relay)|  (other players' positions)
 ```
 
-## C→S 0x26 — Login Attempt
+## JumpToGame (S→C 0x25, friend server) — Connection Redirect
+
+Sent by the friend server to redirect a client to a game server.
+The client then disconnects from any existing game server and connects to the new one.
 
 ```
-[str  world_name]               — room/world name
-[str  token]                    — player auth token
+[str  host_display_name]        — compared with own name for UI text
+[str  random_join_code]         — room token, sent back in C→S 0x26
+[str  ip_address]               — game server IP
+[str  ip_address_type]          — connection mode, e.g. "P2P"
+[i16  port]                     — game server port
+[u8   password_flag]            — read but unused (always 0)
+```
+
+### Client processing:
+1. Strips a character from `host_display_name` (String.Replace with StringLiteral_736)
+2. If cleaned name == own display name → shows "Connecting..."
+3. Otherwise → shows "Joining [name]'s world..."
+4. Calls `GameServerConnector.ConnectToGameServer(ip_address, ip_address_type, port, random_join_code)`
+5. On connect success → calls `GameServerSender.SendLoginAttempt(random_join_code)`
+
+## C→S 0x26 — Login Attempt
+
+RE: `GameServerSender$$SendLoginAttempt`
+
+```
+[str  random_join_code]         — room token from JumpToGame
+[str  username]                 — from PlayerData global (player's username)
 ```
 
 ## S→C 0x02 — Login Success

@@ -1,32 +1,26 @@
-// packet.rs — wire primitives shared by both directions.
+// packet.rs — wire primitives shared by both server types.
 //
 // ┌─ Wire helpers      pack_string / unpack_string / craft_batch / to_hex_upper
 // ├─ Str16             UTF-16LE length-prefixed string (BinRead + BinWrite)
 // ├─ PacketHeader      9-byte batch envelope + packet-ID byte
-// ├─ Constants         DEFAULT_WORLD / LOGIN_SUCCESS_TRAILER
-// └─ Re-exports        ClientPacket (packets_client) + all S→C types (packets_server)
+// └─ Constants         DEFAULT_WORLD / LOGIN_SUCCESS_TRAILER
 //
-// Callers can continue to `use crate::packet::*` for everything protocol-related.
+// Friend-server packets live in server::friend_server::packets_{client,server}.
+// Game-server packets live in server::game_server::packets.
 
 use std::io::Cursor;
 
 use binrw::{binrw, BinRead, BinWrite};
 
-// Re-export the two split modules so all existing `use crate::packet::*` paths
-// continue to resolve without touching any other file.
-pub use crate::defs::packets_client::ClientPacket;
-pub use crate::defs::packets_server::{
-    AcceptFriendOk, AddFriendFail, AddFriendOk, AuthFail, FriendOffline, FriendOnline,
-    GiveGems, HeartbeatReply, JoinGrantHostClear, JumpToGame, PushAccepted, PushFriendReq,
-    PushRemoved, RegisterFail, RegisterOk, RelayJoinReq, RelayPrivateMsg, RemoveFriendOk,
-    ServerPacket, ShowPopup, ShowWarning,
-};
-
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// Sent for any player whose world state has not yet been recorded.
+/// "In Personal World" world-state blob.
 /// Layout: u8(menu_id=1), then 6 zero bytes for room/count fields.
 pub const DEFAULT_WORLD: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+/// "Online, not in a world" world-state blob.
+/// menu_id=0 shows the player as online without a location label.
+pub const IDLE_WORLD: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 /// Fixed footer appended to every LOGIN_SUCCESS response.
 ///

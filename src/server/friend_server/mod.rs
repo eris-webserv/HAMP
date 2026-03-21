@@ -1,5 +1,8 @@
 // friend_server.rs — friend-list / social server (port configurable).
 
+pub mod packets_client;
+pub mod packets_server;
+
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -8,14 +11,14 @@ use rand::distr::{Alphanumeric, SampleString};
 
 use crate::utils::config::Config;
 use crate::server::game_server;
-use crate::defs::packet::{craft_batch, pack_string, to_hex_upper, DEFAULT_WORLD};
-use crate::defs::packet::{
+use crate::defs::packet::{pack_string, to_hex_upper, Str16};
+use crate::defs::state::{SessionConn, SharedState};
+use packets_client::ClientPacket;
+use packets_server::{
     AcceptFriendOk, AddFriendFail, AddFriendOk, AuthFail, FriendOnline, HeartbeatReply,
     JoinGrantHostClear, JumpToGame, PushAccepted, PushFriendReq, PushRemoved,
-    RegisterFail, RegisterOk, RelayJoinReq, RelayPrivateMsg, RemoveFriendOk, ShowPopup, Str16,
+    RegisterFail, RegisterOk, RelayJoinReq, RelayPrivateMsg, RemoveFriendOk, ShowPopup,
 };
-use crate::defs::state::{SessionConn, SharedState};
-use crate::defs::packet::ClientPacket;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -39,15 +42,18 @@ fn build_login_success(username: &str, state: &SharedState) -> Vec<u8> {
     let friends = state.db.get_friends(username);
     resp.extend_from_slice(&(friends.len() as u16).to_le_bytes());
     for f_user in &friends {
-        let is_on: u8 = if sessions.contains_key(f_user.as_str()) { 1 } else { 0 };
+        let is_on = sessions.contains_key(f_user.as_str());
+        let world = worlds.get(f_user.as_str());
         resp.extend_from_slice(&pack_string(f_user));
         resp.extend_from_slice(&pack_string(f_user)); // username = display
-        resp.push(is_on);
-        if is_on == 1 {
-            let w = worlds.get(f_user.as_str()).map(|w| w.as_slice()).unwrap_or(DEFAULT_WORLD);
-            resp.extend_from_slice(w);
+        resp.push(is_on as u8);
+        if is_on && world.is_some() {
+            resp.extend_from_slice(world.unwrap());
         } else {
-            resp.push(0x00); // mandatory offline marker
+            // Offline, or online with no WorldUpdate yet — single 0x00 byte
+            // (menu_id=0, no trailing fields). Sending more bytes here would
+            // misalign the parser and corrupt subsequent friend entries.
+            resp.push(0x00);
         }
     }
 
@@ -81,7 +87,7 @@ pub fn handle_packet(
     packet:       ClientPacket,
     conn:         &Arc<SessionConn>,
     current_user: &mut Option<String>,
-    state:        &SharedState,
+    state:        &Arc<SharedState>,
     cfg:          &Config,
 ) {
     match packet {
@@ -121,9 +127,9 @@ pub fn handle_packet(
 
                 state.sessions.write().unwrap()
                     .insert(canonical.clone(), Arc::clone(conn));
-                state.world_states.write().unwrap()
-                    .entry(canonical.clone())
-                    .or_insert_with(|| DEFAULT_WORLD.to_vec());
+                // Clear any stale world state from a previous session.
+                // The client will send a fresh WorldUpdate (0x2C) shortly.
+                state.world_states.write().unwrap().remove(&canonical);
 
                 state.broadcast_status(&canonical, true);
 
@@ -201,7 +207,7 @@ pub fn handle_packet(
 
                     // Confirm to acceptor.
                     let world_t = if is_on_t {
-                        worlds.get(&t).cloned().unwrap_or_else(|| DEFAULT_WORLD.to_vec())
+                        worlds.get(&t).cloned().unwrap_or_else(|| vec![0x00])
                     } else {
                         vec![0x00]
                     };
@@ -217,7 +223,7 @@ pub fn handle_packet(
                     if let Some(tc) = sessions.get(&t).map(Arc::clone) {
                         let world_u = worlds.get(user.as_str())
                             .cloned()
-                            .unwrap_or_else(|| DEFAULT_WORLD.to_vec());
+                            .unwrap_or_else(|| vec![0x00]);
 
                         // Notify requester they were accepted.
                         tc.send_pkt(
@@ -313,22 +319,29 @@ pub fn handle_packet(
         // ── JOIN REQUEST (0x2D) ────────────────────────────────────────────
         // Relays the request to the target host. Extra byte is always 0x00
         // per Ghidra analysis — the client value is ignored.
+        // If the target is a dummy world bot, auto-accept after 3 seconds.
         ClientPacket::JoinReq { target: target_raw, .. } => {
             if let Some(ref user) = *current_user {
                 let t = state.db.get_player(&target_raw)
                     .map(|p| p.username)
                     .unwrap_or_else(|| target_raw.clone());
-                let target_conn = state.sessions.read().unwrap()
-                    .get(&t)
-                    .map(Arc::clone);
-                if let Some(tc) = target_conn {
-                    tc.send_pkt(
-                        &RelayJoinReq {
-                            from:       Str16::new(user),
-                            extra_byte: 0x00,
-                        },
-                        "S->C [RELAY_JOIN_REQ]",
-                    );
+
+                // Check if target is a dummy world — auto-accept instead of relaying.
+                if state.dummy_worlds.read().unwrap().contains_key(&t) {
+                    crate::server::game_server::dummy_world::handle_auto_accept(user, &t, state, cfg);
+                } else {
+                    let target_conn = state.sessions.read().unwrap()
+                        .get(&t)
+                        .map(Arc::clone);
+                    if let Some(tc) = target_conn {
+                        tc.send_pkt(
+                            &RelayJoinReq {
+                                from:       Str16::new(user),
+                                extra_byte: 0x00,
+                            },
+                            "S->C [RELAY_JOIN_REQ]",
+                        );
+                    }
                 }
             }
         }
@@ -362,7 +375,7 @@ pub fn handle_packet(
                         let room = room_name.unwrap_or_else(|| user.clone());
                         let ip   = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
 
-                        if let Some(port) = game_server::spawn_session(room.clone(), cfg) {
+                        if let Some(port) = game_server::spawn_relay_session(room.clone(), cfg) {
                             let jump = JumpToGame {
                                 display:       Str16::new(user),
                                 token:         Str16::new(&room),
@@ -490,6 +503,7 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
         if is_ours {
             sessions.remove(user);
             drop(sessions);
+            state.world_states.write().unwrap().remove(user);
             state.broadcast_status(user, false);
         } else {
             drop(sessions);

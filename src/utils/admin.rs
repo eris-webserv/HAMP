@@ -14,6 +14,8 @@
 //   recv <hex>            — feed a raw client packet to the spoofed user
 //   reports               — list all player reports
 //   db <base64-sql>       — run a raw SQL query against the database
+//   startworld            — host a managed world on the spoofed user
+//   stopworld             — stop the spoofed user's world and boot players
 //   restart               — kill the server process (systemd will restart it)
 //
 // Adding a new command
@@ -29,7 +31,9 @@ use base64::Engine as _;
 
 use crate::utils::config::Config;
 use crate::server::friend_server::handle_packet;
-use crate::defs::packet::{craft_batch, to_hex_upper, ClientPacket, PushRemoved, ServerPacket, Str16};
+use crate::server::friend_server::packets_client::ClientPacket;
+use crate::server::friend_server::packets_server::{PushRemoved, ServerPacket};
+use crate::defs::packet::{craft_batch, to_hex_upper, Str16};
 use crate::defs::state::{SessionConn, SharedState};
 
 // ── Per-connection admin state ──────────────────────────────────────────────
@@ -129,7 +133,7 @@ fn session(mut stream: TcpStream, password: String, state: Arc<SharedState>, cfg
 
 // ── Dispatch ───────────────────────────────────────────────────────────────
 
-fn dispatch(cmd: &str, args: &str, adm: &mut AdminSession, state: &SharedState) -> String {
+fn dispatch(cmd: &str, args: &str, adm: &mut AdminSession, state: &Arc<SharedState>) -> String {
     match cmd.to_lowercase().as_str() {
         "list"    => cmd_list(state, args),
         "send"    => cmd_send(state, args),
@@ -139,12 +143,16 @@ fn dispatch(cmd: &str, args: &str, adm: &mut AdminSession, state: &SharedState) 
         "spoof"   => cmd_spoof(adm, state, args),
         "unspoof" => cmd_unspoof(adm, state),
         "recv"    => cmd_recv(adm, state, args),
-        "reports" => cmd_reports(state),
-        "db"      => cmd_db(state, args),
-        "restart" => cmd_restart(),
-        "help"    => cmd_help(),
-        "exit"    => cmd_exit(adm),
-        other     => format!("[!] Unknown command '{}'\n", other),
+        "check"      => cmd_check(state, args),
+        "fixdb"      => cmd_fixdb(state),
+        "reports"    => cmd_reports(state),
+        "db"         => cmd_db(state, args),
+        "startworld" => cmd_startworld(adm, state, args),
+        "stopworld"  => cmd_stopworld(adm, state),
+        "restart"    => cmd_restart(),
+        "help"       => cmd_help(),
+        "exit"       => cmd_exit(adm),
+        other        => format!("[!] Unknown command '{}'\n", other),
     }
 }
 
@@ -305,7 +313,7 @@ fn cmd_unspoof(adm: &mut AdminSession, state: &SharedState) -> String {
     format!("Spoof for '{}' removed.\n", name)
 }
 
-fn cmd_recv(adm: &mut AdminSession, state: &SharedState, args: &str) -> String {
+fn cmd_recv(adm: &mut AdminSession, state: &Arc<SharedState>, args: &str) -> String {
     let (user, conn) = match (&adm.spoofed_user, &adm.spoof_conn) {
         (Some(u), Some(c)) => (u.clone(), Arc::clone(c)),
         _ => return "[!] No active spoof — run 'spoof <user>' first.\n".to_string(),
@@ -335,6 +343,57 @@ fn cmd_recv(adm: &mut AdminSession, state: &SharedState, args: &str) -> String {
     }
 }
 
+fn cmd_check(state: &SharedState, args: &str) -> String {
+    let input = args.trim();
+    if input.is_empty() {
+        return "[!] Usage: check <username>\n".to_string();
+    }
+    let username = state.db.get_player(input)
+        .map(|p| p.username)
+        .unwrap_or_else(|| input.to_string());
+
+    if !state.db.player_exists(&username) {
+        return format!("[!] Player '{}' does not exist.\n", username);
+    }
+
+    let friends = state.db.get_friends(&username);
+    let inbound = state.db.get_pending_inbound(&username);
+    let outbound = state.db.get_pending_outbound(&username);
+    let online = state.sessions.read().unwrap().contains_key(username.as_str());
+
+    let mut out = format!("Player: {}  ({})\n", username, if online { "online" } else { "offline" });
+    out.push_str(&format!("  Friends ({}): {}\n", friends.len(),
+        if friends.is_empty() { "none".to_string() } else { friends.join(", ") }));
+    out.push_str(&format!("  Pending inbound ({}): {}\n", inbound.len(),
+        if inbound.is_empty() { "none".to_string() } else { inbound.join(", ") }));
+    out.push_str(&format!("  Pending outbound ({}): {}\n", outbound.len(),
+        if outbound.is_empty() { "none".to_string() } else { outbound.join(", ") }));
+
+    // Flag stale pending rows where they're already friends.
+    let stale_in: Vec<&String> = inbound.iter().filter(|u| friends.contains(u)).collect();
+    let stale_out: Vec<&String> = outbound.iter().filter(|u| friends.contains(u)).collect();
+    if !stale_in.is_empty() || !stale_out.is_empty() {
+        out.push_str("  *** STALE PENDING DETECTED ***\n");
+        for u in &stale_in {
+            out.push_str(&format!("    inbound from '{}' (already friends!)\n", u));
+        }
+        for u in &stale_out {
+            out.push_str(&format!("    outbound to '{}' (already friends!)\n", u));
+        }
+        out.push_str("  Run 'fixdb' to clean these up.\n");
+    }
+    out
+}
+
+fn cmd_fixdb(state: &SharedState) -> String {
+    let cleaned = state.db.cleanup_stale_pending();
+    if cleaned > 0 {
+        format!("Cleaned {} stale pending request(s).\n", cleaned)
+    } else {
+        "No stale pending requests found.\n".to_string()
+    }
+}
+
 fn cmd_reports(state: &SharedState) -> String {
     let reports = state.db.get_reports();
     if reports.is_empty() {
@@ -350,6 +409,30 @@ fn cmd_reports(state: &SharedState) -> String {
     out
 }
 
+fn cmd_startworld(adm: &mut AdminSession, state: &SharedState, args: &str) -> String {
+    // If spoofed, host the world under the spoofed user so their friends can join.
+    // If not spoofed, a name is required and a standalone bot is created.
+    let arg = args.trim();
+    match &adm.spoofed_user {
+        Some(user) => {
+            crate::server::game_server::dummy_world::start_world_for(user, state, &adm.cfg)
+        }
+        None => {
+            if arg.is_empty() {
+                return "[!] Not spoofed — usage: startworld <name>\n".to_string();
+            }
+            crate::server::game_server::dummy_world::start_world(arg, state, &adm.cfg)
+        }
+    }
+}
+
+fn cmd_stopworld(adm: &AdminSession, state: &SharedState) -> String {
+    match &adm.spoofed_user {
+        Some(user) => crate::server::game_server::dummy_world::stop_world(user, state),
+        None => "[!] Not spoofed — nothing to stop.\n".to_string(),
+    }
+}
+
 fn cmd_help() -> String {
     "\
 Commands:\n\
@@ -362,8 +445,12 @@ Commands:\n\
   spoof <user>          — inject a fake session for <user>\n\
   unspoof               — tear down the active fake session\n\
   recv <hex>            — feed a raw client packet to the spoofed user\n\
+  check <user>          — inspect a player's friends/pending state\n\
+  fixdb                 — clean up stale pending requests\n\
   reports               — list all player reports\n\
   db <base64-sql>       — run a raw SQL query against the database\n\
+  startworld            — host a managed world on the spoofed user\n\
+  stopworld             — stop the spoofed user's world and boot players\n\
   restart               — kill the server (systemd will restart it)\n\
   exit                  — close this admin session\n\
 ".to_string()

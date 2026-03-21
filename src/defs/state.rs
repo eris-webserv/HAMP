@@ -1,13 +1,14 @@
 // state.rs — shared runtime state and broadcast helpers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::utils::db::Db;
-use crate::defs::packet::{DEFAULT_WORLD, craft_batch, to_hex_upper};
-use crate::defs::packet::{FriendOffline, FriendOnline, ServerPacket, Str16};
+use crate::defs::packet::{Str16, craft_batch, to_hex_upper};
+use crate::server::friend_server::packets_server::{FriendOffline, FriendOnline, ServerPacket};
+use crate::server::game_server::dummy_world::DummyWorld;
 
 // ── Session connection ─────────────────────────────────────────────────────
 
@@ -100,10 +101,12 @@ impl SessionConn {
 
 /// All mutable state shared across connection-handler threads.
 pub struct SharedState {
-    /// Maps lowercase username → active connection.
+    /// Maps username → active connection.
     pub sessions: RwLock<HashMap<String, Arc<SessionConn>>>,
-    /// Maps lowercase username → last-known world-state blob.
+    /// Maps username → last-known world-state blob.
     pub world_states: RwLock<HashMap<String, Vec<u8>>>,
+    /// Admin-spawned dummy worlds (managed game sessions with auto-accept).
+    pub dummy_worlds: RwLock<HashMap<String, DummyWorld>>,
     /// The database — shared with every handler thread.
     pub db: Arc<Db>,
 }
@@ -111,8 +114,9 @@ pub struct SharedState {
 impl SharedState {
     pub fn new(db: Arc<Db>) -> Arc<Self> {
         Arc::new(Self {
-            sessions:    RwLock::new(HashMap::new()),
+            sessions:     RwLock::new(HashMap::new()),
             world_states: RwLock::new(HashMap::new()),
+            dummy_worlds: RwLock::new(HashMap::new()),
             db,
         })
     }
@@ -126,10 +130,11 @@ impl SharedState {
 
         let payload: Vec<u8> = if online {
             let worlds = self.world_states.read().unwrap();
+            let fallback = vec![0x00u8];
             let world = worlds
                 .get(username)
                 .map(|w| w.as_slice())
-                .unwrap_or(DEFAULT_WORLD);
+                .unwrap_or(&fallback);
             FriendOnline {
                 username:   Str16::new(username),
                 world_data: world.to_vec(),
