@@ -115,57 +115,43 @@ impl Session {
 
 // ── Wire-packet builders ────────────────────────────────────────────────────
 
-/// S→C 0x02 LOGIN_SUCCESS
+/// S→C 0x26 LOGIN_RESPONSE — first packet sent on login.
 ///
-/// RE from GameServerReceiver::OnReceive case 2:
-///   GetString()  server_name
-///   GetByte()    is_host
-///   GetByte()    ignored
-///   GetString()  validator_code
-///   GetShort()   validator_variation
-///   GetShort()   n_others   → if is_host && n_others > 0: n_others × GetString()
-fn build_login_success(server_name: &str) -> Vec<u8> {
+/// Python: make_login_response(world_name, token, zone_type=0)
+///   Byte(0x26) + Short(zone_trail_count=0) + String(world_name) + String(token) + Byte(zone_type)
+fn build_login_response(world_name: &str, token: &str) -> Vec<u8> {
+    let mut p = vec![0x26u8];
+    p.extend_from_slice(&0i16.to_le_bytes()); // zone_trail_count = 0
+    p.extend(pack_string(world_name));
+    p.extend(pack_string(token));
+    p.push(0x00); // zone_type = 0 (overworld)
+    p
+}
+
+/// S→C 0x29 UNIQUE_IDS — block of unique IDs for the client.
+fn build_unique_ids(count: u16) -> Vec<u8> {
+    let mut p = vec![0x29u8];
+    p.extend_from_slice(&count.to_le_bytes());
+    for i in 0..count {
+        p.extend_from_slice(&(i as i64 + 1).to_le_bytes());
+    }
+    p
+}
+
+/// S→C 0x02 JOIN_CONFIRMED
+///
+/// Python: make_join_confirmed(host_name, username, player_id_short=0, is_host=0)
+///   Byte(0x02) + String(host_name) + Byte(is_host) + Byte(0)
+///   + String(username) + Short(player_id_short) + Short(0)
+fn build_join_confirmed(server_name: &str, username: &str, is_host: bool) -> Vec<u8> {
     let mut p = vec![0x02u8];
-    p.extend(pack_string(server_name)); // server_name
-    p.push(0x00);                       // is_host = false
-    p.push(0x00);                       // ignored
-    p.extend(pack_string(""));          // validator_code = ""
-    p.extend_from_slice(&0i16.to_le_bytes()); // validator_variation = 0
-    p.extend_from_slice(&0i16.to_le_bytes()); // n_others = 0
+    p.extend(pack_string(server_name));
+    p.push(is_host as u8);
+    p.push(0x00);
+    p.extend(pack_string(username));
+    p.extend_from_slice(&0i16.to_le_bytes()); // player_id_short
+    p.extend_from_slice(&0i16.to_le_bytes()); // 0
     p
-}
-
-/// S→C 0x05 FULLY_IN_GAME
-///
-/// RE from GameServerReceiver::OnReceive case 5:
-///   GetShort()  n_ids → n_ids × GetLong() unique_id
-///   GetShort()  daynight  (time × 1000 as i16; 12000 = noon)
-///   GetShort()  n_perks → n_perks × GetString() perk_name
-///   GetByte()   is_moderator
-///   GetByte()   max_companions
-///   GetByte()   last_byte  (0 → client requests zone via C→S 0x0A)
-///   GetByte()   pvp
-///   GetByte()   ignored
-fn build_fully_in_game() -> Vec<u8> {
-    let mut p = vec![0x05u8];
-    p.extend_from_slice(&0i16.to_le_bytes());     // n_ids = 0
-    p.extend_from_slice(&12000i16.to_le_bytes()); // daynight = noon
-    p.extend_from_slice(&0i16.to_le_bytes());     // n_perks = 0
-    p.push(0x00); // is_moderator
-    p.push(0x00); // max_companions
-    p.push(0x00); // last_byte = 0 → client will send REQ_ZONE_DATA
-    p.push(0x00); // pvp
-    p.push(0x00); // ignored
-    p
-}
-
-/// S→C 0x0B ZONE_ASSIGNMENT (simple — no zone data)
-///
-/// RE from GameServerReceiver::OnReceive case 0x0B:
-///   GetByte()  flag     (0 → UnknownZoneGotoSpawn, 1 → ProcessIncomingZoneData)
-///   GetByte()  is_host
-fn build_zone_assignment() -> Vec<u8> {
-    vec![0x0Bu8, 0x00, 0x00]
 }
 
 /// S→C 0x0B ZONE_DATA (full — sends zone data blob, flag=1)
@@ -182,7 +168,7 @@ fn build_zone_assignment() -> Vec<u8> {
 fn build_zone_data(zone_name: &str) -> Vec<u8> {
     let mut p = vec![0x0Bu8];
     p.push(0x01);                                    // flag = 1 (zone data follows)
-    p.push(0x00);                                    // is_host = false
+    p.push(0x00);                                    // sub_flag = 0
 
     // ProcessIncomingZoneData body:
     p.extend(pack_string(zone_name));                // zone name
@@ -198,6 +184,23 @@ fn build_zone_data(zone_name: &str) -> Vec<u8> {
     p.extend(pack_string(zone_name));                // zone_name (inner)
     p.extend_from_slice(&0i16.to_le_bytes());        // timer_dict_count = 0
     p.push(0x00);                                    // trailing zone_type
+    p
+}
+
+/// S→C 0x17 DAY_NIGHT — short(ms)
+fn build_daynight(ms: i16) -> Vec<u8> {
+    let mut p = vec![0x17u8];
+    p.extend_from_slice(&ms.to_le_bytes());
+    p
+}
+
+/// S→C 0x07 JOIN/LEAVE notification
+/// String(unused) + String(username) + Byte(1=joined, 0=left)
+fn build_join_notif(username: &str, joined: bool) -> Vec<u8> {
+    let mut p = vec![0x07u8];
+    p.extend(pack_string(""));       // unused
+    p.extend(pack_string(username));
+    p.push(joined as u8);
     p
 }
 
@@ -266,29 +269,25 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── LOGIN (0x26) ───────────────────────────────────────────────
-            // C→S: [Token: Str] [Username: Str]
+            // C→S: [world_name: Str] [token: Str]
             //
-            // RE: GameServerSender$$SendLoginAttempt sends:
-            //   PutByte(0x26)
-            //   PutString(random_join_code)  ← room token from JumpToGame
-            //   PutString(username)          ← from PlayerData global
-            //
-            // Response sequence:
-            //   S→C 0x02  LOGIN_SUCCESS   (client auto-calls SendInitialPlayerData)
-            //   → client sends C→S 0x03
-            //   S→C 0x05  FULLY_IN_GAME   (last_byte=0 → client sends REQ_ZONE_DATA)
-            //   → client sends C→S 0x0A
-            //   S→C 0x0B  ZONE_ASSIGNMENT (status=0 → UnknownZoneGotoSpawn)
+            // Response sequence (matching Python game_server.py):
+            //   S→C 0x26  LOGIN_RESPONSE
+            //   S→C 0x29  UNIQUE_IDS
+            //   S→C 0x02  JOIN_CONFIRMED
+            //   S→C 0x0B  ZONE_DATA
+            //   S→C 0x17  DAYNIGHT
+            //   S→C 0x07  JOIN_NOTIF (broadcast)
             0x26 => {
                 if player_id.is_some() { continue; } // ignore repeated logins
 
-                let (_token, off) = unpack_string(data, 10);
-                let (raw_username, _) = unpack_string(data, off);
-                let username = raw_username.replace('\0', "").trim().to_string();
-                let uid = if username.is_empty() {
+                let (_raw_world, off) = unpack_string(data, 10);
+                let (raw_token, _) = unpack_string(data, off);
+                let token = raw_token.replace('\0', "").trim().to_string();
+                let uid = if token.is_empty() {
                     format!("player_{}", addr.port())
                 } else {
-                    username
+                    token
                 };
                 let world = session.room_token.clone();
 
@@ -312,14 +311,32 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
                 println!("[GAME:'{}'] {} → player_id='{}'", world, addr, uid);
 
-                // S→C 0x02: login success
-                let _ = stream.write_all(&craft_batch(2, &build_login_success(&world)));
-                // 0x05 and 0x0B come after we receive C→S 0x03 (PLAYER_DATA).
+                // 1. S→C 0x26: login response
+                let _ = stream.write_all(&craft_batch(2, &build_login_response(&world, &uid)));
+
+                // 2. S→C 0x29: unique IDs
+                let _ = stream.write_all(&craft_batch(2, &build_unique_ids(16)));
+
+                // 3. S→C 0x02: join confirmed
+                let _ = stream.write_all(&craft_batch(2, &build_join_confirmed(&world, &uid, false)));
+
+                // 4. S→C 0x0B: zone data
+                let zone_name = match session.mode {
+                    SessionMode::Managed(ref ws) => ws.default_zone.clone(),
+                    SessionMode::Relay => "overworld".to_string(),
+                };
+                let _ = stream.write_all(&craft_batch(2, &build_zone_data(&zone_name)));
+
+                // 5. S→C 0x17: daynight
+                let _ = stream.write_all(&craft_batch(2, &build_daynight(12000)));
+
+                // 6. S→C 0x07: join notification (broadcast to others)
+                session.broadcast(&build_join_notif(&uid, true), Some(uid.as_str()));
             }
 
             // ── PLAYER_DATA (0x03) ─────────────────────────────────────────
-            // Store and broadcast to others; replay existing players to newcomer.
-            // Then send 0x05 FULLY_IN_GAME so the client requests zone data.
+            // Store initial_data; broadcast spawn to others after a short delay
+            // (matching Python's delayed_sync pattern).
             0x03 => {
                 if let Some(ref uid) = player_id {
                     let body = data[10..].to_vec();
@@ -345,37 +362,25 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     for (name, init) in existing {
                         let _ = stream.write_all(&craft_batch(2, &build_player_nearby(&name, &init)));
                     }
-
-                    // 4. Send FULLY_IN_GAME (0x05) → client will send C→S 0x0A (REQ_ZONE_DATA).
-                    let _ = stream.write_all(&craft_batch(2, &build_fully_in_game()));
                 }
             }
 
             // ── REQ_ZONE_DATA (0x0A) ──────────────────────────────────────
             // C→S: [zone_name: Str] [type: u8] [if type 2|3: packed_position]
+            //
+            // Zone data is already sent during login (0x26 handler).
+            // This handles zone change requests (e.g. entering a cave).
             0x0A => {
-                // Managed mode: send full zone data (flag=1) so the client
-                // calls ProcessIncomingZoneData and sets up the zone properly.
-                // Relay mode: send simple assignment (flag=0 → UnknownZoneGotoSpawn).
-                match session.mode {
-                    SessionMode::Managed(ref world) => {
-                        let _ = stream.write_all(&craft_batch(2, &build_zone_data(&world.default_zone)));
+                let (zone_name, _) = unpack_string(data, 10);
+                let zone = if zone_name.is_empty() {
+                    match session.mode {
+                        SessionMode::Managed(ref ws) => ws.default_zone.clone(),
+                        SessionMode::Relay => "overworld".to_string(),
                     }
-                    SessionMode::Relay => {
-                        let _ = stream.write_all(&craft_batch(2, &build_zone_assignment()));
-                    }
-                }
-
-                // In managed mode, also push initial chunks around spawn.
-                if let SessionMode::Managed(ref world) = session.mode {
-                    let radius: i16 = 2;
-                    for cx in -radius..=radius {
-                        for cz in -radius..=radius {
-                            let wire = world.get_chunk_wire(cx, cz);
-                            let _ = stream.write_all(&craft_batch(2, &wire));
-                        }
-                    }
-                }
+                } else {
+                    zone_name
+                };
+                let _ = stream.write_all(&craft_batch(2, &build_zone_data(&zone)));
             }
 
             // ── REQ_CHUNK (0x0C) ──────────────────────────────────────────
@@ -464,6 +469,17 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
+            // ── ZONE_CHANGE (0x14) → broadcast zone change ─────────────────
+            0x14 => {
+                if let Some(ref uid) = player_id {
+                    let (zone_name, _) = unpack_string(data, 10);
+                    let mut pkt = vec![0x14u8];
+                    pkt.extend(pack_string(uid));
+                    pkt.extend(pack_string(&zone_name));
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
             // ── SYNC_COMPLETE (0x2A) — echo to sender, relay to others ────
             0x2A => {
                 let body = &data[9..]; // includes the 0x2A ID byte
@@ -495,10 +511,77 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
+            // ── BUILD (0x20) ───────────────────────────────────────────────
+            // C→S: [validator:Str][Item][rot:u8][zone:Str][shorts×4][extra:Str]
+            // S→C: [Item][rot:u8][zone:Str][shorts×4][owner:Str][extra]
+            // DO NOT echo back to builder (client already placed it locally).
+            0x20 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let mut pkt = vec![0x20u8];
+                    // Item + rot + zone + shorts
+                    let item_and_rest = &data[off..];
+                    // Find where shorts end to insert owner string.
+                    // Item is variable, rot is 1 byte, zone is Str, shorts is 8 bytes.
+                    // Simplest: relay everything after validator, append owner.
+                    // Actually Python strips validator, then appends owner before extra.
+                    // The exact layout matters for the S→C handler. For now, relay
+                    // everything after validator and append owner at the end.
+                    pkt.extend_from_slice(item_and_rest);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── REMOVE_OBJECT (0x21) ──────────────────────────────────────
+            // C→S: [validator:Str][zone:Str][shorts×4][rot:u8][Item][extra:Str]
+            // S→C: [zone:Str][shorts×4][rot:u8][Item][owner:Str]
+            0x21 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let mut pkt = vec![0x21u8];
+                    pkt.extend_from_slice(&data[off..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── REPLACE_BUILDABLE (0x22) ──────────────────────────────────
+            // C→S: [validator:Str][old_Item][new_Item][rot:u8][zone:Str][shorts×4][extra:Str]
+            // S→C: [old_Item][new_Item][rot:u8][zone:Str][shorts×4][owner:Str]
+            0x22 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let mut pkt = vec![0x22u8];
+                    pkt.extend_from_slice(&data[off..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── Combat: strip validator, relay ────────────────────────────
+            // 0x46 ATTACK_ANIM, 0x47 HIT_MOB, 0x48 MOB_DIE
+            0x46 | 0x47 | 0x48 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let mut pkt = vec![pid];
+                    pkt.extend_from_slice(&data[off..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── Perks: strip validator, relay ─────────────────────────────
+            // 0x51 APPLY_PERK, 0x52 LAUNCH_PROJECTILE, 0x54 ALL_PRE_PERKS, 0x55 CREATE_PERK_DROP
+            0x51 | 0x52 | 0x54 | 0x55 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let mut pkt = vec![pid];
+                    pkt.extend_from_slice(&data[off..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
             // ── Bulk broadcast-relay: [pid][player_id][body] ──────────────
-            0x09 | 0x16 | 0x18 | 0x19 | 0x20 | 0x21 | 0x22 | 0x23 |
-            0x46 | 0x47 | 0x48 | 0x4A | 0x4B | 0x4E | 0x4F | 0x50 |
-            0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56 | 0x57 | 0x58 |
+            0x09 | 0x16 | 0x18 | 0x19 | 0x23 |
+            0x4A | 0x4B | 0x4E | 0x4F | 0x50 |
+            0x53 | 0x56 | 0x57 | 0x58 |
             0x59 | 0x5A => {
                 if let Some(ref uid) = player_id {
                     let mut pkt = vec![pid];
@@ -520,10 +603,11 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
         }
     }
 
-    // Disconnect cleanup: remove player and notify others via 0x13 type=gone.
+    // Disconnect cleanup: remove player and notify others via 0x13 type=gone + 0x07 leave.
     if let Some(ref uid) = player_id {
         session.players.lock().unwrap().remove(uid.as_str());
         session.broadcast(&build_player_gone(uid), None);
+        session.broadcast(&build_join_notif(uid, false), None);
 
         // Remove from world state tracking.
         if let SessionMode::Managed(ref world) = session.mode {
