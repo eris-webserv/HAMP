@@ -1058,6 +1058,38 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
+            // ── MOB_DATA_REQUEST (0x42) — point-to-point relay ───────────
+            // C→S: [target_owner: Str] [rest...]
+            // Relay to target as: [0x42][requester: Str][rest...]
+            // The guest asks a specific player (usually the host) for mob
+            // data (companions, NPCs, etc). The owner responds with 0x43.
+            0x42 => {
+                if let Some(ref uid) = player_id {
+                    let (target_owner, off) = unpack_string(data, 10);
+                    if !target_owner.is_empty() {
+                        let mut relay = vec![0x42u8];
+                        relay.extend(pack_string(uid));        // requester
+                        relay.extend_from_slice(&data[off..]);  // rest of body
+                        session.send_to(&target_owner, &relay);
+                    }
+                }
+            }
+
+            // ── MOB_DATA_RESPONSE (0x43) — point-to-point relay ──────────
+            // C→S: [target_requester: Str] [rest...]
+            // Relay to target as: [0x43][responder: Str][rest...]
+            0x43 => {
+                if let Some(ref uid) = player_id {
+                    let (target_requester, off) = unpack_string(data, 10);
+                    if !target_requester.is_empty() {
+                        let mut relay = vec![0x43u8];
+                        relay.extend(pack_string(uid));        // responder
+                        relay.extend_from_slice(&data[off..]);  // rest of body
+                        session.send_to(&target_requester, &relay);
+                    }
+                }
+            }
+
             // ── Bulk broadcast-relay: [pid][player_id][body] ──────────────
             0x09 | 0x18 | 0x19 | 0x23 |
             0x4A | 0x4B | 0x4E | 0x4F | 0x50 |
