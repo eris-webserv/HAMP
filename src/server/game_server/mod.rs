@@ -29,6 +29,51 @@ use crate::utils::config::Config;
 use crate::defs::packet::{craft_batch, pack_string, unpack_string};
 use world_state::WorldState;
 
+// ── Inventory / basket wire helpers ───────────────────────────────────────
+
+/// Skips past an `InventoryItem::UnpackFromWeb` blob and returns the new offset.
+///
+/// Wire layout:
+///   Short(short_prop_count) + [String(key) + Short(value)] × count
+///   Short(string_prop_count) + [String(key) + String(value)] × count
+///   Short(long_prop_count)   + [String(key) + Long(value)]  × count
+fn skip_inventory_item(data: &[u8], mut off: usize) -> usize {
+    // Short properties
+    if off + 2 > data.len() { return off; }
+    let count = u16::from_le_bytes([data[off], data[off + 1]]) as usize; off += 2;
+    for _ in 0..count {
+        let (_, o) = unpack_string(data, off); off = o; // key
+        off += 2; // short value
+    }
+    // String properties
+    if off + 2 > data.len() { return off; }
+    let count = u16::from_le_bytes([data[off], data[off + 1]]) as usize; off += 2;
+    for _ in 0..count {
+        let (_, o) = unpack_string(data, off); off = o; // key
+        let (_, o) = unpack_string(data, off); off = o; // value
+    }
+    // Long properties
+    if off + 2 > data.len() { return off; }
+    let count = u16::from_le_bytes([data[off], data[off + 1]]) as usize; off += 2;
+    for _ in 0..count {
+        let (_, o) = unpack_string(data, off); off = o; // key
+        off += 4; // long value (u32)
+    }
+    off
+}
+
+/// Skips past a `BasketContents` blob (slot_count × [index + quantity + InventoryItem]).
+/// Returns the new offset past the last slot.
+fn skip_basket_contents(data: &[u8], mut off: usize) -> usize {
+    if off + 2 > data.len() { return off; }
+    let slot_count = u16::from_le_bytes([data[off], data[off + 1]]) as usize; off += 2;
+    for _ in 0..slot_count {
+        off += 2 + 2; // index + quantity
+        off = skip_inventory_item(data, off);
+    }
+    off
+}
+
 // ── Per-session player ─────────────────────────────────────────────────────
 
 struct GamePlayer {
@@ -606,6 +651,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // ── REQ_CONTAINER (0x1A) ──────────────────────────────────────
             // C→S: [validator:Str][basket_id:u32][type:u8][chunk:Str][shorts×4]
             // Relay mode: forward to host as 0x1C + String(requester) + Long(basket_id)
+            //
+            // The host client also sends 0x1A when opening its own containers
+            // (despite ShouldSaveLocally=true). We must relay 0x1C back to the
+            // host so it loads from disk and responds with 0x1B.
             0x1A => {
                 if let Some(ref uid) = player_id {
                     let (_, off) = unpack_string(data, 10); // skip validator
@@ -621,6 +670,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 session.pending_containers.lock().unwrap()
                                     .entry(bk).or_default().push(uid.clone());
 
+                                // Relay 0x1C to the host (works for both host-self
+                                // and guest requests — host loads from disk either way).
                                 let mut relay = vec![0x1Cu8];
                                 relay.extend(pack_string(uid));
                                 relay.extend_from_slice(&basket_id.to_le_bytes());
@@ -663,13 +714,19 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
             // ── CLOSE_BASKET (0x1E) — relay to host in relay mode ────────
             // C→S: [validator:Str][basket_id:u32][BasketContents][item_name:Str][chunk:Str][shorts×4]
-            // S→C: [basket_id:u32][BasketContents][item_name:Str] (broadcast)
+            // S→C: [basket_id:u32][BasketContents][item_name:Str] (broadcast, no trailing chunk/shorts)
             0x1E => {
                 if let Some(ref uid) = player_id {
                     let (_, off) = unpack_string(data, 10); // skip validator
-                    // Broadcast the close to other players (strip validator)
+                    // Parse through to find where item_name ends (exclude trailing chunk+shorts)
+                    let basket_start = off;
+                    let after_basket_id = off + 4;
+                    let after_contents = skip_basket_contents(data, after_basket_id);
+                    let (_item_name, after_item_name) = unpack_string(data, after_contents);
+
+                    // Build S→C: basket_id + BasketContents + item_name (no trailing fields)
                     let mut pkt = vec![0x1Eu8];
-                    pkt.extend_from_slice(&data[off..]);
+                    pkt.extend_from_slice(&data[basket_start..after_item_name]);
                     session.broadcast(&pkt, Some(uid.as_str()));
 
                     // In relay mode, also forward save to host
@@ -677,10 +734,11 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         let host = session.host.lock().unwrap().clone();
                         if let Some(ref hname) = host {
                             if uid != hname {
-                                // Send to host for persistence
+                                // Send to host for persistence:
+                                // [0x1E] + String(requester) + basket_id + BasketContents + item_name
                                 let mut relay = vec![0x1Eu8];
                                 relay.extend(pack_string(uid));
-                                relay.extend_from_slice(&data[off..]);
+                                relay.extend_from_slice(&data[basket_start..after_item_name]);
                                 session.send_to(hname, &relay);
                             }
                         }
@@ -955,6 +1013,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             world.players.write().unwrap().remove(uid.as_str());
         }
 
+        // In relay mode, if the host disconnects, shut down the entire session.
+        if matches!(session.mode, SessionMode::Relay) {
+            let is_host = session.host.lock().unwrap()
+                .as_ref()
+                .map(|h| h == uid)
+                .unwrap_or(false);
+            if is_host {
+                println!("[GAME:'{}'] Host '{}' left — shutting down relay session", session.room_token, uid);
+                session.stop();
+            }
+        }
+
         println!("[GAME:'{}'] '{}' disconnected ({})", session.room_token, uid, addr);
     }
 }
@@ -996,19 +1066,26 @@ pub fn spawn_relay_session(room_token: String, cfg: &Config) -> Option<u16> {
         let addr = format!("{}:{}", cfg.host, port);
         if let Ok(listener) = TcpListener::bind(&addr) {
             let session = Session::new(room_token.clone(), SessionMode::Relay);
+            *session.listen_addr.lock().unwrap() = listener.local_addr().ok();
+            let accept_session = Arc::clone(&session);
             println!("[GAME] Relay session '{}' → port {}", room_token, port);
             std::thread::spawn(move || {
                 for incoming in listener.incoming() {
+                    if accept_session.shutdown.load(Ordering::Relaxed) { break; }
                     match incoming {
                         Ok(stream) => {
                             let peer = stream.peer_addr()
                                 .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-                            let sess = Arc::clone(&session);
+                            let sess = Arc::clone(&accept_session);
                             std::thread::spawn(move || handle_client(stream, peer, sess));
                         }
-                        Err(e) => eprintln!("[GAME] accept error on port {}: {}", port, e),
+                        Err(e) => {
+                            if accept_session.shutdown.load(Ordering::Relaxed) { break; }
+                            eprintln!("[GAME] accept error on port {}: {}", port, e);
+                        }
                     }
                 }
+                println!("[GAME] Relay session '{}' listener closed (port {})", accept_session.room_token, port);
             });
             return Some(port);
         }

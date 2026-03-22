@@ -192,8 +192,8 @@ pub fn handle_packet(
                 let resp = build_login_success(&canonical, state);
                 conn.send(2, &resp, "S->C [LOGIN_SUCCESS]");
 
-                // After login, send 0x16 sync for each online friend (matches Python).
-                // This ensures the client reinitialises friend state on reconnection.
+                // Send 0x16 for each online friend so the client fully
+                // initialises friend presence state after login.
                 {
                     let sessions = state.sessions.read().unwrap();
                     let worlds   = state.world_states.read().unwrap();
@@ -448,55 +448,96 @@ pub fn handle_packet(
                     tc.send_pkt(&JoinGrantHostClear, "S->C [JOINER_UI_UNFREEZE]");
 
                     // 3. Reuse existing relay session or spawn a new one.
+                    //    The map tracks ALL players in relay sessions (hosts + guests).
+                    //    If the granting user is already in someone else's world,
+                    //    the joiner gets sent to that same session.
                     let room = user.clone();
                     let ip   = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
 
-                    // Check if the host already has a live relay session.
                     let existing_port = {
                         let relays = state.active_relay_sessions.read().unwrap();
                         relays.get(user).copied()
                     };
 
-                    let port = if let Some(p) = existing_port {
-                        // Probe the port to make sure it's still alive.
+                    if let Some(p) = existing_port {
+                        // Granter is already in a relay session — send ONLY the
+                        // joiner there.  Do NOT re-jump the granter.
                         use std::net::TcpStream;
-                        match TcpStream::connect_timeout(
+                        let alive = TcpStream::connect_timeout(
                             &format!("127.0.0.1:{}", p).parse().unwrap(),
                             std::time::Duration::from_secs(2),
-                        ) {
-                            Ok(_) => {
-                                println!("[FRIEND] Reusing existing relay session on port {}", p);
-                                Some(p)
-                            }
-                            Err(_) => {
-                                println!("[FRIEND] Stale relay session on port {}, spawning new", p);
-                                state.active_relay_sessions.write().unwrap().remove(user);
-                                let new_port = game_server::spawn_relay_session(room.clone(), cfg);
-                                if let Some(np) = new_port {
-                                    state.active_relay_sessions.write().unwrap().insert(user.clone(), np);
-                                }
-                                new_port
+                        ).is_ok();
+
+                        if alive {
+                            println!("[FRIEND] {} already in relay on port {}, sending joiner {} there",
+                                     user, p, t);
+                            state.active_relay_sessions.write().unwrap().insert(t.clone(), p);
+                            // Joiner gets their OWN username as token so the
+                            // game server can distinguish them from the host.
+                            let jump_joiner = JumpToGame {
+                                display:       Str16::new(user),
+                                token:         Str16::new(&t),
+                                host_ip:       Str16::new(ip),
+                                mode:          Str16::new(ip),
+                                port:          p,
+                                password_flag: 0x00,
+                            };
+                            tc.send_pkt(&jump_joiner, "S->C [JUMP_SIGNAL_JOINER]");
+                        } else {
+                            // Stale session — clean up and spawn fresh.
+                            println!("[FRIEND] Stale relay on port {}, spawning new", p);
+                            state.active_relay_sessions.write().unwrap().remove(user);
+                            if let Some(np) = game_server::spawn_relay_session(room.clone(), cfg) {
+                                state.active_relay_sessions.write().unwrap().insert(user.clone(), np);
+                                state.active_relay_sessions.write().unwrap().insert(t.clone(), np);
+                                // Host token = host username (matches room_token → host).
+                                // Joiner token = joiner username (won't match → guest).
+                                let jump_host = JumpToGame {
+                                    display:       Str16::new(user),
+                                    token:         Str16::new(&room),
+                                    host_ip:       Str16::new(ip),
+                                    mode:          Str16::new(ip),
+                                    port:          np,
+                                    password_flag: 0x00,
+                                };
+                                let jump_joiner = JumpToGame {
+                                    display:       Str16::new(user),
+                                    token:         Str16::new(&t),
+                                    host_ip:       Str16::new(ip),
+                                    mode:          Str16::new(ip),
+                                    port:          np,
+                                    password_flag: 0x00,
+                                };
+                                tc.send_pkt(&jump_joiner, "S->C [JUMP_SIGNAL_JOINER]");
+                                conn.send_pkt(&jump_host, "S->C [JUMP_SIGNAL_HOST]");
                             }
                         }
                     } else {
-                        let new_port = game_server::spawn_relay_session(room.clone(), cfg);
-                        if let Some(np) = new_port {
+                        // No existing session — spawn a new relay.
+                        if let Some(np) = game_server::spawn_relay_session(room.clone(), cfg) {
                             state.active_relay_sessions.write().unwrap().insert(user.clone(), np);
+                            state.active_relay_sessions.write().unwrap().insert(t.clone(), np);
+                            // Host token = host username (matches room_token → host).
+                            // Joiner token = joiner username (won't match → guest).
+                            let jump_host = JumpToGame {
+                                display:       Str16::new(user),
+                                token:         Str16::new(&room),
+                                host_ip:       Str16::new(ip),
+                                mode:          Str16::new(ip),
+                                port:          np,
+                                password_flag: 0x00,
+                            };
+                            let jump_joiner = JumpToGame {
+                                display:       Str16::new(user),
+                                token:         Str16::new(&t),
+                                host_ip:       Str16::new(ip),
+                                mode:          Str16::new(ip),
+                                port:          np,
+                                password_flag: 0x00,
+                            };
+                            tc.send_pkt(&jump_joiner, "S->C [JUMP_SIGNAL_JOINER]");
+                            conn.send_pkt(&jump_host, "S->C [JUMP_SIGNAL_HOST]");
                         }
-                        new_port
-                    };
-
-                    if let Some(port) = port {
-                        let jump = JumpToGame {
-                            display:       Str16::new(user),
-                            token:         Str16::new(&room),
-                            host_ip:       Str16::new(ip),
-                            mode:          Str16::new(ip),  // fallback IP (same as primary)
-                            port,
-                            password_flag: 0x00,
-                        };
-                        tc.send_pkt(&jump, "S->C [JUMP_SIGNAL_JOINER]");
-                        conn.send_pkt(&jump, "S->C [JUMP_SIGNAL_HOST]");
                     }
                 }
             }
