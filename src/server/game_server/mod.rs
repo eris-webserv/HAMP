@@ -374,20 +374,13 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
 
                 // In relay mode, the room_token is the host's username.
-                // First player whose name matches (case-insensitive) becomes host.
-                // If no match, first player in becomes host (fallback).
+                // Only the player whose name matches becomes host.
                 let is_host = match session.mode {
                     SessionMode::Relay => {
                         let mut host = session.host.lock().unwrap();
-                        if host.is_none() {
-                            if uid.eq_ignore_ascii_case(&world) {
-                                *host = Some(uid.clone());
-                                true
-                            } else {
-                                // Not the expected host — check if host slot is still empty
-                                // after a moment (first-come fallback)
-                                false
-                            }
+                        if host.is_none() && uid.eq_ignore_ascii_case(&world) {
+                            *host = Some(uid.clone());
+                            true
                         } else {
                             false
                         }
@@ -395,20 +388,24 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     SessionMode::Managed(_) => false,
                 };
 
-                // If no host was assigned yet and this isn't the expected host,
-                // assign first player as host if nobody else takes the slot.
+                // In relay mode, guests must wait for the host to connect
+                // before proceeding — the host's client serves all world data.
+                // Wait up to 5 seconds, then disconnect if no host appears.
                 if matches!(session.mode, SessionMode::Relay) && !is_host {
-                    let mut host = session.host.lock().unwrap();
-                    if host.is_none() {
-                        *host = Some(uid.clone());
-                        println!("[GAME:'{}'] Fallback host: '{}'", world, uid);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        if session.host.lock().unwrap().is_some() { break; }
+                        if std::time::Instant::now() >= deadline {
+                            println!("[GAME:'{}'] Guest '{}' timed out waiting for host",
+                                     world, uid);
+                            session.players.lock().unwrap().remove(&uid);
+                            break 'outer;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
 
-                let is_host_flag = session.host.lock().unwrap()
-                    .as_ref()
-                    .map(|h| h == &uid)
-                    .unwrap_or(false);
+                let is_host_flag = is_host;
 
                 if is_host_flag {
                     println!("[GAME:'{}'] {} → HOST player_id='{}'", world, addr, uid);
