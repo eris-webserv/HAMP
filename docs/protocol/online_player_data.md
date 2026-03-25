@@ -44,10 +44,13 @@ which may cause rendering glitches but avoids complex binary parsing. This is
 a known compromise — fixing it requires implementing full binary
 parse/repack for PackPosition, InventoryItem, and ZoneData formats.
 
-## PackedPosition / PackedRotation (TODO)
+## PackedPosition / PackedRotation
 
-These use a custom packing scheme. Need to decompile:
-- `PackPosition` / `UnpackPosition`
-- `PackRotation` / `UnpackRotation`
+See [position_rotation.md](position_rotation.md) for full format.
+- **PackedPosition:** 4 × i16 (chunk_x, chunk_z, local_x, local_z) — 8 bytes
+- **PackedRotation:** 4 × i16 (qx, qy, qz, qw × 100) — 8 bytes
 
-to understand the exact byte layout. These are critical for player movement.
+## See Also
+
+- [game_server_packets.md](game_server_packets.md) — complete packet ID reference
+- C→S 0x03 sends player data; S→C 0x13 type=1 sends OnlinePlayerData for nearby players
