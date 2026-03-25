@@ -854,14 +854,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── TELE_START (0x15) → relay as S→C 0x0C ────────────────────
+            // ── TELE_START (0x15) → broadcast to same zone ──────────────
+            // C→S: [str tele_str]
+            // S→C: [str destination]
             0x15 => {
                 if let Some(ref uid) = player_id {
-                    let (tele_name, _) = unpack_string(data, 10);
-                    let mut pkt = vec![0x0Cu8];
-                    pkt.extend(pack_string(uid));
-                    pkt.extend(pack_string(&tele_name));
-                    session.broadcast(&pkt, Some(uid.as_str()));
+                    let player_zone = session.players.lock().unwrap()
+                        .get(uid.as_str())
+                        .map(|p| p.zone.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    let mut pkt = vec![0x15u8];
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast_zone(&pkt, &player_zone, Some(uid.as_str()));
                 }
             }
 
@@ -1006,11 +1010,25 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── Combat: strip validator, relay ────────────────────────────
-            // 0x46 ATTACK_ANIM, 0x47 HIT_MOB, 0x48 MOB_DIE
-            0x46 | 0x47 | 0x48 => {
+            // ── ATTACK_ANIM (0x46) — no validator, zone-scoped relay ─────
+            // C→S: [str combat_id]
+            0x46 => {
                 if let Some(ref uid) = player_id {
-                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let player_zone = session.players.lock().unwrap()
+                        .get(uid.as_str())
+                        .map(|p| p.zone.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    let mut pkt = vec![0x46u8];
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast_zone(&pkt, &player_zone, Some(uid.as_str()));
+                }
+            }
+
+            // ── Combat: strip fn_validator (first string), relay ────────
+            // 0x47 HIT_MOB, 0x48 MOB_DIE — validator is first field on wire
+            0x47 | 0x48 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip fn_validator
                     let mut pkt = vec![pid];
                     pkt.extend_from_slice(&data[off..]);
                     session.broadcast(&pkt, Some(uid.as_str()));
@@ -1090,16 +1108,323 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── Bulk broadcast-relay: [pid][player_id][body] ──────────────
-            0x09 | 0x18 | 0x19 | 0x23 |
-            0x4A | 0x4B | 0x4E | 0x4F | 0x50 |
-            0x53 | 0x56 | 0x57 | 0x58 |
-            0x59 | 0x5A => {
+            // ── GUARD_DIE (0x09) — relay body as-is, no player prefix ────
+            // C→S: [str mob_name][str owner_name]
+            // S→C: [str guard_name][str additional_info] — no prefix
+            0x09 => {
+                if player_id.is_some() {
+                    let mut pkt = vec![0x09u8];
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast(&pkt, None);
+                }
+            }
+
+            // ── Zone-scoped player-prefixed relay ───────────────────────
+            // S→C format has [str player_name] first — visual/state updates
+            // visible to players in the same zone.
+            // 0x18 EQUIP_CHANGE, 0x19 CREATURE_CHANGE,
+            // 0x4E COMPANION_EQUIP, 0x4F RENAME_COMPANION, 0x50 DESTROY_COMPANION
+            0x18 | 0x19 | 0x4E | 0x4F | 0x50 => {
+                if let Some(ref uid) = player_id {
+                    let player_zone = session.players.lock().unwrap()
+                        .get(uid.as_str())
+                        .map(|p| p.zone.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    let mut pkt = vec![pid];
+                    pkt.extend(pack_string(uid));
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast_zone(&pkt, &player_zone, Some(uid.as_str()));
+                }
+            }
+
+            // ── Strip fn_validator, broadcast ───────────────────────────
+            // 0x4B INCREASE_HP, 0x53 QUICK_TAG — validator is first field
+            0x4B | 0x53 => {
+                if let Some(ref uid) = player_id {
+                    let (_, off) = unpack_string(data, 10); // skip fn_validator
+                    let mut pkt = vec![pid];
+                    pkt.extend_from_slice(&data[off..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── Global player-prefixed relay ────────────────────────────
+            // Packets where S→C format has [str player_name] and all
+            // players need to see it regardless of zone.
+            // 0x23 LAND_CLAIM, 0x4A (unknown), 0x56 RESPAWN,
+            // 0x57 RETURNING_TO_BREEDER, 0x58 UPDATE_SYNCED_TARGETS,
+            // 0x59 CREATED_LOCAL_MOB, 0x5A BANDIT_FLAG_DESTROYED
+            0x23 | 0x4A | 0x56 | 0x57 | 0x58 | 0x59 | 0x5A => {
                 if let Some(ref uid) = player_id {
                     let mut pkt = vec![pid];
                     pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
                     session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── Teleporter packets — relay to host ──────────────────────
+            // These are processed by the host client which owns teleporter
+            // data. The host responds with S→C packets directly.
+            //
+            // 0x2E REQ_TELE_PAGE: guest asks for a page of teleporters
+            // 0x2F TELE_PAGE_DATA: host sends page back (needs routing)
+            // 0x30 TELE_SCREENSHOT_UPLOAD: screenshot data for a teleporter
+            // 0x31 REQ_TELE_SCREENSHOT: guest asks for a screenshot
+            // 0x32 TELE_SCREENSHOT_RESPONSE: host sends screenshot back
+            // 0x33 FINISHED_EDITING_TELE: notify others of edit
+            // 0x34 NEW_TELE_SEARCH: search request → relay to host
+            0x2E | 0x31 | 0x34 => {
+                // Guest→host: relay with requester name so host can respond
+                if let Some(ref uid) = player_id {
+                    if matches!(session.mode, SessionMode::Relay) {
+                        let host = session.host.lock().unwrap().clone();
+                        if let Some(ref hname) = host {
+                            let is_host = hname == uid;
+                            if !is_host {
+                                let mut relay = vec![pid];
+                                relay.extend(pack_string(uid));
+                                relay.extend_from_slice(&data[10..]);
+                                session.send_to(hname, &relay);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 0x2F TELE_PAGE_DATA — host→guest point-to-point
+            // C→S: [str user_requesting][i16 page][u8 has_more][u8 count][tele data...]
+            // Route the response to the named user.
+            0x2F => {
+                if let Some(ref uid) = player_id {
+                    let is_host = session.host.lock().unwrap()
+                        .as_ref().map(|h| h == uid).unwrap_or(false);
+                    if is_host {
+                        let (target_user, off) = unpack_string(data, 10);
+                        if !target_user.is_empty() {
+                            // S→C 0x2F: [i16 page][u8 has_more][u8 count][tele data...]
+                            let mut pkt = vec![0x2Fu8];
+                            pkt.extend_from_slice(&data[off..]);
+                            session.send_to(&target_user, &pkt);
+                        }
+                    } else {
+                        // Non-host sending 0x2F — relay to host
+                        let host = session.host.lock().unwrap().clone();
+                        if let Some(ref hname) = host {
+                            let mut relay = vec![0x2Fu8];
+                            relay.extend(pack_string(uid));
+                            relay.extend_from_slice(&data[10..]);
+                            session.send_to(hname, &relay);
+                        }
+                    }
+                }
+            }
+
+            // 0x30 TELE_SCREENSHOT_UPLOAD — broadcast to all (screenshot cache)
+            0x30 => {
+                if let Some(ref uid) = player_id {
+                    let mut pkt = vec![0x30u8];
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // 0x32 TELE_SCREENSHOT_RESPONSE — host→guest point-to-point
+            // Host sends: [str requester][str tele_id][i32 size][bytes...]
+            0x32 => {
+                if let Some(ref uid) = player_id {
+                    let is_host = session.host.lock().unwrap()
+                        .as_ref().map(|h| h == uid).unwrap_or(false);
+                    if is_host {
+                        let (target_user, off) = unpack_string(data, 10);
+                        if !target_user.is_empty() {
+                            let mut pkt = vec![0x32u8];
+                            pkt.extend_from_slice(&data[off..]);
+                            session.send_to(&target_user, &pkt);
+                        }
+                    }
+                }
+            }
+
+            // 0x33 FINISHED_EDITING_TELE — broadcast to all
+            0x33 => {
+                if player_id.is_some() {
+                    let mut pkt = vec![0x33u8];
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast(&pkt, None);
+                }
+            }
+
+            // ── Minigame packets — point-to-point relay ─────────────────
+            // Minigames are between two named players. Most packets include
+            // a target player name as the first field.
+            //
+            // 0x35 CHALLENGE_MINIGAME: [str target_username][u8 type]
+            // 0x36 MINIGAME_RESPONSE: [u8 response][str challenger][u8 type]
+            // 0x37 BEGIN_MINIGAME: [str owner][u8 response][u8 type][ball_layout...]
+            // 0x38 EXIT_MINIGAME: empty payload — broadcast to all
+            // 0x39 POOL_CUE_POS: [i32 angle] — broadcast to all
+            // 0x3A POOL_SHOOT: [i32 deg][i16 power][recording...] — broadcast
+            // 0x3B POOL_SYNC_READY: empty — broadcast
+            // 0x3C POOL_PLACE_WHITE: [i16 x][i16 y] — broadcast
+            // 0x3D POOL_PLAY_AGAIN: empty — broadcast
+
+            // 0x35 CHALLENGE — route to target player
+            0x35 => {
+                if let Some(ref uid) = player_id {
+                    let (target, off) = unpack_string(data, 10);
+                    if !target.is_empty() {
+                        let mut pkt = vec![0x35u8];
+                        pkt.extend(pack_string(uid)); // challenger
+                        pkt.extend_from_slice(&data[off..]); // minigame_type
+                        session.send_to(&target, &pkt);
+                    }
+                }
+            }
+
+            // 0x36 MINIGAME_RESPONSE — route to challenger
+            0x36 => {
+                if let Some(ref uid) = player_id {
+                    // C→S: [u8 response][str challenger][u8 type]
+                    if data.len() > 10 {
+                        let response = data[10];
+                        let (challenger, off) = unpack_string(data, 11);
+                        if !challenger.is_empty() {
+                            let mut pkt = vec![0x36u8];
+                            pkt.push(response);
+                            pkt.extend(pack_string(uid)); // responder name
+                            if off < data.len() {
+                                pkt.extend_from_slice(&data[off..]); // type
+                            }
+                            session.send_to(&challenger, &pkt);
+                        }
+                    }
+                }
+            }
+
+            // 0x37 BEGIN_MINIGAME — route to named owner
+            0x37 => {
+                if let Some(ref uid) = player_id {
+                    let (owner, off) = unpack_string(data, 10);
+                    if !owner.is_empty() {
+                        let mut pkt = vec![0x37u8];
+                        pkt.extend(pack_string(uid)); // sender
+                        pkt.extend_from_slice(&data[off..]); // response + type + ball_layout
+                        session.send_to(&owner, &pkt);
+                    }
+                }
+            }
+
+            // 0x38-0x3D POOL/MINIGAME STATE — broadcast to all players
+            // These are realtime game state updates visible to all.
+            0x38 | 0x39 | 0x3A | 0x3B | 0x3C | 0x3D => {
+                if let Some(ref uid) = player_id {
+                    let mut pkt = vec![pid];
+                    pkt.extend(pack_string(uid));
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── SIT_IN_CHAIR (0x3E) — zone-scoped broadcast ────────────
+            // C→S: [str chair_id]  (empty = finished sitting)
+            // S→C: [str player_name][str chair_id]
+            0x3E => {
+                if let Some(ref uid) = player_id {
+                    let player_zone = session.players.lock().unwrap()
+                        .get(uid.as_str())
+                        .map(|p| p.zone.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    let mut pkt = vec![0x3Eu8];
+                    pkt.extend(pack_string(uid));
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast_zone(&pkt, &player_zone, Some(uid.as_str()));
+                }
+            }
+
+            // ── TRY_CLAIM_MOBS (0x3F) — relay to host ──────────────────
+            // C→S: [i16 count][mob data...] — host processes mob ownership
+            0x3F => {
+                if let Some(ref uid) = player_id {
+                    if matches!(session.mode, SessionMode::Relay) {
+                        let host = session.host.lock().unwrap().clone();
+                        if let Some(ref hname) = host {
+                            let mut relay = vec![0x3Fu8];
+                            relay.extend(pack_string(uid));
+                            relay.extend_from_slice(&data[10..]);
+                            session.send_to(hname, &relay);
+                        }
+                    }
+                }
+            }
+
+            // ── DELOAD_MOB (0x40) — broadcast ───────────────────────────
+            // C→S: [str combat_id]
+            0x40 => {
+                if let Some(ref uid) = player_id {
+                    let mut pkt = vec![0x40u8];
+                    pkt.extend(pack_string(uid));
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // ── EXP_RECEIVE (0x4C) — zone-scoped, no prefix ────────────
+            // C→S: [str text][Pos position] — visual popup
+            0x4C => {
+                if let Some(ref uid) = player_id {
+                    let player_zone = session.players.lock().unwrap()
+                        .get(uid.as_str())
+                        .map(|p| p.zone.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    let mut pkt = vec![0x4Cu8];
+                    pkt.extend_from_slice(&data[10..]);
+                    session.broadcast_zone(&pkt, &player_zone, Some(uid.as_str()));
+                }
+            }
+
+            // ── CLAIM_OBJECT (0x27) / RELEASE_INTERACTING (0x28) ────────
+            // 0x27: [str obj_str] — relay to host for object ownership
+            // 0x28: empty — relay to host
+            0x27 | 0x28 => {
+                if let Some(ref uid) = player_id {
+                    if matches!(session.mode, SessionMode::Relay) {
+                        let host = session.host.lock().unwrap().clone();
+                        if let Some(ref hname) = host {
+                            let mut relay = vec![pid];
+                            relay.extend(pack_string(uid));
+                            relay.extend_from_slice(&data[10..]);
+                            session.send_to(hname, &relay);
+                        }
+                    }
+                }
+            }
+
+            // ── REQ_UNIQUE_IDS (0x29) — server generates and sends back ─
+            0x29 => {
+                if player_id.is_some() {
+                    let _ = stream.write_all(&craft_batch(2, &build_unique_ids(16)));
+                }
+            }
+
+            // ── Host-originated S→C packets — relay as-is ─────────────
+            // These are already in S→C format when the host sends them.
+            // The server must NOT prepend a player name.
+            //
+            // 0x08 COMPANION_DEATH_CHAT: [str player_name][str message]
+            // 0x24 LAND_CLAIM_TIMER: [u8 type][str chunk_key][timer data...]
+            // 0x25 ZONE_DATA_REFRESH: ZoneData::UnpackFromWeb body
+            // 0x45 MOB_RESPAWN: [str combat_id] — destroy + respawn mob
+            0x08 | 0x24 | 0x25 | 0x45 => {
+                if let Some(ref uid) = player_id {
+                    // Only the host should be sending these.
+                    let is_host = session.host.lock().unwrap()
+                        .as_ref().map(|h| h == uid).unwrap_or(false);
+                    if is_host || !matches!(session.mode, SessionMode::Relay) {
+                        let mut pkt = vec![pid];
+                        pkt.extend_from_slice(&data[10..]);
+                        session.broadcast(&pkt, Some(uid.as_str()));
+                    }
                 }
             }
 
