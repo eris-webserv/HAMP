@@ -569,9 +569,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 let _ = stream.write_all(&craft_batch(2, &build_zone_data(&zone)));
                             } else if let Some(ref hname) = host {
                                 // Guest → relay to host.
+                                // Host expects: Str(zone_name) + Str(requester) + u8(type) [+ Pos if type 2|3]
                                 let mut relay = vec![0x0Au8];
-                                relay.extend(pack_string(uid));
                                 relay.extend(pack_string(&zone_name));
+                                relay.extend(pack_string(uid));
                                 relay.push(zone_type);
                                 if data.len() > off + 1 {
                                     relay.extend_from_slice(&data[off + 1..]);
@@ -586,10 +587,17 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // ── REQ_CHUNK (0x0C) ──────────────────────────────────────────
             0x0C => {
                 if let Some(ref uid) = player_id {
+                    // C→S: [str zone][i16 x][i16 z][u8 dimension][str sub_zone]
                     let (zone_name, off) = unpack_string(data, 10);
                     if data.len() >= off + 4 {
                         let x = i16::from_le_bytes([data[off], data[off + 1]]);
                         let z = i16::from_le_bytes([data[off + 2], data[off + 3]]);
+                        // Skip dimension byte (off+4), read sub_zone at off+5
+                        let (sub_zone, _) = if data.len() > off + 5 {
+                            unpack_string(data, off + 5)
+                        } else {
+                            (String::new(), off + 5)
+                        };
 
                         match session.mode {
                             SessionMode::Managed(ref world) => {
@@ -607,14 +615,15 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                     let _ = stream.write_all(&craft_batch(2, &empty));
                                 } else if host.is_some() {
                                     // Guest → relay request to host.
-                                    // S→C 0x0C to host: String(requester) + String(zone) + Short(x) + Short(z)
-                                    let chunk_key = format!("{}_{}_{}",  zone_name, x, z);
+                                    // Host expects: Str(requester) + Str(zone) + Str(sub_zone) + i16(x) + i16(z)
+                                    let chunk_key = format!("{}_{}_{}_{}",  zone_name, sub_zone, x, z);
                                     session.pending_chunks.lock().unwrap()
                                         .entry(chunk_key).or_default().push(uid.clone());
 
                                     let mut relay = vec![0x0Cu8];
                                     relay.extend(pack_string(uid));
                                     relay.extend(pack_string(&zone_name));
+                                    relay.extend(pack_string(&sub_zone));
                                     relay.extend_from_slice(&x.to_le_bytes());
                                     relay.extend_from_slice(&z.to_le_bytes());
                                     session.send_to(host.as_ref().unwrap(), &relay);
@@ -1289,8 +1298,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         let (challenger, off) = unpack_string(data, 11);
                         if !challenger.is_empty() {
                             let mut pkt = vec![0x36u8];
+                            pkt.extend(pack_string(uid)); // responder name first
                             pkt.push(response);
-                            pkt.extend(pack_string(uid)); // responder name
                             if off < data.len() {
                                 pkt.extend_from_slice(&data[off..]); // type
                             }
@@ -1317,8 +1326,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // These are realtime game state updates visible to all.
             0x38 | 0x39 | 0x3A | 0x3B | 0x3C | 0x3D => {
                 if let Some(ref uid) = player_id {
+                    // S→C format: raw payload only, no player name prefix
                     let mut pkt = vec![pid];
-                    pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
                     session.broadcast(&pkt, Some(uid.as_str()));
                 }
