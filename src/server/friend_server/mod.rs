@@ -2,6 +2,7 @@
 
 pub mod packets_client;
 pub mod packets_server;
+pub mod server_registry;
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -14,6 +15,7 @@ use crate::server::game_server;
 use crate::defs::packet::{pack_string, to_hex_upper, Str16};
 use crate::defs::state::{SessionConn, SharedState};
 use packets_client::ClientPacket;
+use server_registry::RegisteredServer;
 use packets_server::{
     AcceptFriendOk, AddFriendFail, AddFriendOk, AuthFail, FriendOnline, HeartbeatReply,
     JoinGrantHostClear, JumpToGame, PushAccepted, PushFriendReq, PushRemoved,
@@ -57,6 +59,24 @@ fn strip_world_update(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&s1);
     out.extend_from_slice(&wp);
     out
+}
+
+// ── Public server list builders ────────────────────────────────────────────
+
+/// S→C 0x1D — full public server list.
+fn build_server_list(servers: &[RegisteredServer]) -> Vec<u8> {
+    let mut p = vec![0x1Du8, servers.len().min(255) as u8];
+    for s in servers {
+        p.extend(pack_string(&s.name));
+        p.extend(pack_string(&s.desc1));
+        p.extend(pack_string(&s.desc2));
+        p.extend(pack_string(&s.desc3));
+        p.extend(pack_string(&s.desc4));
+        p.extend_from_slice(&s.n_online.to_le_bytes());
+        p.extend_from_slice(&s.max_players.to_le_bytes());
+        p.extend(pack_string(&s.game_mode));
+    }
+    p
 }
 
 // ── Login response builder ─────────────────────────────────────────────────
@@ -192,24 +212,10 @@ pub fn handle_packet(
                 let resp = build_login_success(&canonical, state);
                 conn.send(2, &resp, "S->C [LOGIN_SUCCESS]");
 
-                // Send 0x16 for each online friend so the client fully
-                // initialises friend presence state after login.
-                {
-                    let sessions = state.sessions.read().unwrap();
-                    let worlds   = state.world_states.read().unwrap();
-                    let friends  = state.db.get_friends(&canonical);
-                    for f in &friends {
-                        if sessions.contains_key(f.as_str()) {
-                            let w = worlds.get(f.as_str())
-                                .map(|v| v.as_slice())
-                                .unwrap_or(crate::defs::packet::DEFAULT_WORLD);
-                            let pkt = FriendOnline {
-                                username:   Str16::new(f),
-                                world_data: w.to_vec(),
-                            };
-                            conn.send_pkt(&pkt, "S->C [SYNC_ONLINE_FRIEND]");
-                        }
-                    }
+                // Send the current public server list.
+                let servers = state.public_servers.read().unwrap();
+                if !servers.is_empty() {
+                    conn.send(2, &build_server_list(&servers), "S->C [SERVER_LIST]");
                 }
             } else {
                 conn.send_pkt(&AuthFail, "S->C [AUTH_FAIL]");
@@ -226,8 +232,7 @@ pub fn handle_packet(
         // sender and pushes an incoming-request notification to the target
         // if they are online.
         //
-        // Response quirk: AddFriendOk uses display FIRST, username SECOND.
-        // PushFriendReq uses username FIRST, display SECOND.
+        // PushFriendReq uses username FIRST, display SECOND (same order).
         ClientPacket::AddFriend { target: target_raw } => {
             if let Some(ref user) = *current_user {
                 // Resolve to canonical stored casing.
@@ -238,8 +243,8 @@ pub fn handle_packet(
                 if t != *user && state.db.add_friend_request(user, &t) {
                     conn.send_pkt(
                         &AddFriendOk {
-                            display:  Str16::new(&t),
                             username: Str16::new(&t),
+                            display:  Str16::new(&t),
                         },
                         "S->C [ADD_OK]",
                     );
@@ -575,6 +580,40 @@ pub fn handle_packet(
                 state.broadcast_status(user, true);
             }
         }
+
+        // ── TRY JOIN SERVER (0x1E) ─────────────────────────────────────────
+        // Client wants to join a public server by name.  Look up the server
+        // and send JumpToGame immediately — no ping round-trip needed since
+        // we have exactly one candidate.
+        ClientPacket::TryJoinServer { server_name } => {
+            if current_user.is_some() {
+                let server = state.public_servers.read().unwrap()
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&server_name))
+                    .cloned();
+                if let Some(s) = server {
+                    // 0x1E Byte(1) — "connecting" acknowledgment; puts the
+                    // client into the connecting state before 0x25 arrives.
+                    conn.send(2, &[0x1Eu8, 0x01], "S->C [JOIN_ACK]");
+                    let ip = if cfg.public_ip.is_empty() { &cfg.host } else { &cfg.public_ip };
+                    conn.send_pkt(
+                        &JumpToGame {
+                            display:       Str16::new(&s.name),
+                            token:         Str16::new(&s.room_token),
+                            host_ip:       Str16::new(&s.public_ip),
+                            mode:          Str16::new(ip),
+                            port:          s.port,
+                            password_flag: 0x00,
+                        },
+                        "S->C [JUMP_TO_GAME_PUBLIC]",
+                    );
+                }
+            }
+        }
+
+        // ── PING RESULTS (0x20) ────────────────────────────────────────────
+        // We don't send a ping dispatch, so this should never arrive — drop.
+        ClientPacket::PingResults { .. } => {}
     }
 }
 
@@ -598,7 +637,7 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
 
     let conn = SessionConn::new_real(stream, peer_ip);
     let mut rd = read_copy;
-    let mut current_user: Option<String> = None;
+    let mut current_user:  Option<String> = None;
     let mut last_heartbeat = std::time::Instant::now();
 
     println!("\n[FRIEND] New connection: {}", addr);
@@ -674,6 +713,9 @@ fn handle_client(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<Share
 // ── Server entry point ─────────────────────────────────────────────────────
 
 pub fn run(cfg: &Config, state: Arc<SharedState>) {
+    // Start the external game-server registry listener (no-op if unconfigured).
+    server_registry::run(cfg, Arc::clone(&state.public_servers));
+
     let addr = format!("{}:{}", cfg.host, cfg.friend_port);
     let listener = TcpListener::bind(&addr)
         .unwrap_or_else(|e| panic!("Failed to bind friend server to {}: {}", addr, e));

@@ -34,6 +34,15 @@ pub struct Config {
     /// Set to an empty string to disable the terminal entirely.
     pub terminal_password: String,
 
+    // ── Public server registry ─────────────────────────────────────────────
+    /// TCP port that external game servers connect to for registry.
+    /// Set to 0 to disable the registry listener.
+    pub registry_port: u16,
+
+    /// Shared secret that external game servers must present to authenticate.
+    /// Leave empty to disable the registry (no servers can register).
+    pub registry_secret: String,
+
     // ── Persistence ────────────────────────────────────────────────────────
     /// Path to the SQLite database file.  Relative paths are resolved from
     /// the working directory where the server binary is run.
@@ -50,6 +59,8 @@ impl Default for Config {
             public_ip:     String::new(),
             terminal_port:     7006,
             terminal_password: String::new(),
+            registry_port:     7004,
+            registry_secret:   String::new(),
             db_path:       "friend_server.db".to_string(),
         }
     }
@@ -116,6 +127,15 @@ terminal_port = 7006
 
 # Password required to log in. Leave empty ("") to disable the terminal.
 terminal_password = ""
+
+# ── Public server registry ──────────────────────────────────────────────────
+# Port that external game servers connect to for registry.
+# Set to 0 to disable.
+registry_port = 7004
+
+# Shared secret external game servers must present on connect.
+# Leave empty ("") to disable the registry entirely.
+registry_secret = ""
 
 # ── Persistence ────────────────────────────────────────────────────────────
 # Path to the SQLite database file (relative to the server's working dir).

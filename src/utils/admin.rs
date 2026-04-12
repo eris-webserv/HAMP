@@ -104,7 +104,7 @@ fn session(mut stream: TcpStream, password: String, state: Arc<SharedState>, cfg
         }
     }
 
-    let _ = stream.write_all(b"Hello. Run 'help' to get the current list of commands.\n");
+    let _ = stream.write_all(format!("AUTHENTICATED - HAMP v{}\n", env!("CARGO_PKG_VERSION")).as_bytes());
     println!("[terminal] {} authenticated", peer);
 
     let mut adm = AdminSession::new(cfg);

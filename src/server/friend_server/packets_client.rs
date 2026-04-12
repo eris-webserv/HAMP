@@ -87,6 +87,21 @@ pub enum ClientPacket {
         extra_byte: u8,
     },
 
+    /// `0x1E` — request to join a public server by name.
+    TryJoinServer {
+        server_name: String,
+    },
+
+    /// `0x20` — ping results for server selection.
+    ///
+    /// Sent after the server issues a 0x20 ping-dispatch packet. Each entry
+    /// is the key string from the dispatch paired with the measured ping (ms).
+    /// The server uses these to pick the best target and respond with 0x25.
+    PingResults {
+        /// `(key, ping_ms)` pairs — key matches the IP string sent in 0x20.
+        entries: Vec<(String, i16)>,
+    },
+
     /// `0x2E` — submit a player report.
     ///
     /// The client sends an i32 count followed by that many UTF-16LE key/value
@@ -170,6 +185,26 @@ impl ClientPacket {
                 Some(Self::PrivateMsg { target: target.value, message: message.value })
             }
 
+            // ── TRY_JOIN_SERVER (0x1E) ───────────────────────────────────
+            // C→S  [server_name: Str16]
+            0x1E => {
+                let server_name = Str16::read(&mut cur).ok()?;
+                Some(Self::TryJoinServer { server_name: server_name.value })
+            }
+
+            // ── PING_RESULTS (0x20) ───────────────────────────────────────
+            // C→S  [count: i16] [count × (key: Str16, ping_ms: i16)]
+            0x20 => {
+                let count: i16 = cur.read_le().ok()?;
+                let mut entries = Vec::with_capacity(count.max(0) as usize);
+                for _ in 0..count.max(0) {
+                    let key:     Str16 = Str16::read(&mut cur).ok()?;
+                    let ping_ms: i16   = cur.read_le().ok()?;
+                    entries.push((key.value, ping_ms));
+                }
+                Some(Self::PingResults { entries })
+            }
+
             // ── JOIN_GRANT (0x2B) ─────────────────────────────────────────
             // C→S  [target: Str16]
             // The client sends only the target username — no status byte.
@@ -233,6 +268,8 @@ impl ClientPacket {
             Self::AcceptFriend { .. } => PacketId::AcceptFriend,
             Self::RemoveFriend { .. } => PacketId::RemoveFriend,
             Self::PrivateMsg { .. }   => PacketId::PrivateMsg,
+            Self::TryJoinServer { .. } => PacketId::TryJoinServer,
+            Self::PingResults { .. }   => PacketId::PingResults,
             Self::JoinGrant { .. }    => PacketId::JoinGrant,
             Self::WorldUpdate { .. }  => PacketId::WorldUpdate,
             Self::JoinReq { .. }      => PacketId::JoinReq,

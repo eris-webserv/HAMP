@@ -1,38 +1,23 @@
-// packets_server.rs — S→C packet definitions.
+// packets_server.rs — S→C packet definitions (friend server).
 //
-// `ServerPacket` is the trait every server-to-client struct implements.
-// `to_payload()` prepends the packet-ID byte and serialises the fields,
-// producing bytes that are passed directly to `conn.send` / `craft_batch`.
+// `ServerPacket` is defined in `defs::packet` and shared across servers.
+// `to_payload()` prepends the packet-ID byte and serialises the fields.
 //
 // Adding a new S→C packet
 // ────────────────────────
-// 1. Add the ID to `PacketId` in structs.rs.
+// 1. Add the ID to `PacketId` in structs.rs (optional but recommended).
 // 2. Add a struct with `#[binwrite]` for the payload fields (omit the ID byte).
-// 3. `impl ServerPacket for YourStruct { const ID: u8 = 0x??; }`
+// 3. `impl_server_packet!(YourStruct, 0x??);`
 //
 // `world_data` fields are `Vec<u8>` — binrw writes Vec<u8> as raw bytes with
 // no length prefix, which is correct here because the receiver derives the
 // length from the outer batch header's `total_len`.
 
-use std::io::Cursor;
-
-use binrw::{binwrite, BinWrite};
+use binrw::binwrite;
 
 use crate::defs::packet::Str16;
-
-// ── ServerPacket trait ─────────────────────────────────────────────────────
-
-pub trait ServerPacket: for<'a> BinWrite<Args<'a> = ()> {
-    const ID: u8;
-
-    fn to_payload(&self) -> Vec<u8> {
-        let mut buf = vec![Self::ID];
-        let mut cur = Cursor::new(Vec::new());
-        self.write_le(&mut cur).expect("ServerPacket serialisation failed");
-        buf.extend(cur.into_inner());
-        buf
-    }
-}
+pub use crate::defs::packet::ServerPacket;
+use crate::impl_server_packet;
 
 // ── Registration ──────────────────────────────────────────────────────────
 
@@ -48,7 +33,7 @@ pub struct RegisterOk {
     pub display:  Str16,
     pub token:    Str16,
 }
-impl ServerPacket for RegisterOk { const ID: u8 = 0x0A; }
+impl_server_packet!(RegisterOk, 0x0A);
 
 /// `0x0A 0x02` — registration rejected (username already taken).
 ///
@@ -60,7 +45,7 @@ pub struct RegisterFail {
     #[bw(calc = 0x02u8)] _status: u8,
     pub name: Str16,
 }
-impl ServerPacket for RegisterFail { const ID: u8 = 0x0A; }
+impl_server_packet!(RegisterFail, 0x0A);
 
 // ── Authentication ────────────────────────────────────────────────────────
 
@@ -71,7 +56,7 @@ impl ServerPacket for RegisterFail { const ID: u8 = 0x0A; }
 #[derive(Debug, Default)]
 #[bw(little)]
 pub struct AuthFail;
-impl ServerPacket for AuthFail { const ID: u8 = 0x0C; }
+impl_server_packet!(AuthFail, 0x0C);
 
 // ── Heartbeat ─────────────────────────────────────────────────────────────
 
@@ -82,28 +67,27 @@ impl ServerPacket for AuthFail { const ID: u8 = 0x0C; }
 #[derive(Debug, Default)]
 #[bw(little)]
 pub struct HeartbeatReply;
-impl ServerPacket for HeartbeatReply { const ID: u8 = 0x0F; }
+impl_server_packet!(HeartbeatReply, 0x0F);
 
 // ── Friend requests ───────────────────────────────────────────────────────
 
 /// `0x10 0x00` — friend request sent successfully.
 ///
-/// IMPORTANT: the game client expects **display FIRST, username SECOND** here,
-/// which is the opposite of most other packets. This is a confirmed quirk of
-/// the protocol.
+/// Wire (after packet-ID): [0x00] [username: Str16] [display: Str16]
 ///
-/// Wire (after packet-ID): [0x00] [display: Str16] [username: Str16]
+/// IDA confirmed: client reads username FIRST (used in the "now friends with X"
+/// popup and as the Friend ctor's username arg), display SECOND.
 #[binwrite]
 #[derive(Debug)]
 #[bw(little)]
 pub struct AddFriendOk {
     #[bw(calc = 0x00u8)] _status: u8,
+    /// Raw (canonical) username of the target player.
+    pub username: Str16,
     /// Display name of the target player.
     pub display:  Str16,
-    /// Raw (un-lowercased) username of the target player.
-    pub username: Str16,
 }
-impl ServerPacket for AddFriendOk { const ID: u8 = 0x10; }
+impl_server_packet!(AddFriendOk, 0x10);
 
 /// `0x10 0x01` — friend request failed (target not found or already friends).
 ///
@@ -115,7 +99,7 @@ pub struct AddFriendFail {
     #[bw(calc = 0x01u8)] _status: u8,
     pub target: Str16,
 }
-impl ServerPacket for AddFriendFail { const ID: u8 = 0x10; }
+impl_server_packet!(AddFriendFail, 0x10);
 
 /// `0x11` — an incoming friend request pushed to the target player.
 ///
@@ -129,7 +113,7 @@ pub struct PushFriendReq {
     pub username: Str16,
     pub display:  Str16,
 }
-impl ServerPacket for PushFriendReq { const ID: u8 = 0x11; }
+impl_server_packet!(PushFriendReq, 0x11);
 
 // ── Accept / push_accepted ────────────────────────────────────────────────
 
@@ -151,7 +135,7 @@ pub struct AcceptFriendOk {
     /// Either the 7-byte world-state blob (online) or `[0x00]` (offline).
     pub world_data: Vec<u8>,
 }
-impl ServerPacket for AcceptFriendOk { const ID: u8 = 0x12; }
+impl_server_packet!(AcceptFriendOk, 0x12);
 
 /// `0x13` — pushed to the player whose outbound request was just accepted.
 ///
@@ -168,7 +152,7 @@ pub struct PushAccepted {
     #[bw(calc = 0x01u8)] _online: u8,
     pub world_data: Vec<u8>,
 }
-impl ServerPacket for PushAccepted { const ID: u8 = 0x13; }
+impl_server_packet!(PushAccepted, 0x13);
 
 // ── Removal ───────────────────────────────────────────────────────────────
 
@@ -181,7 +165,7 @@ impl ServerPacket for PushAccepted { const ID: u8 = 0x13; }
 pub struct PushRemoved {
     pub username: Str16,
 }
-impl ServerPacket for PushRemoved { const ID: u8 = 0x15; }
+impl_server_packet!(PushRemoved, 0x15);
 
 /// `0x18` — confirmation to the initiating client that removal succeeded.
 ///
@@ -192,7 +176,7 @@ impl ServerPacket for PushRemoved { const ID: u8 = 0x15; }
 pub struct RemoveFriendOk {
     pub target: Str16,
 }
-impl ServerPacket for RemoveFriendOk { const ID: u8 = 0x18; }
+impl_server_packet!(RemoveFriendOk, 0x18);
 
 // ── Presence broadcasts ───────────────────────────────────────────────────
 
@@ -206,7 +190,7 @@ pub struct FriendOnline {
     pub username:   Str16,
     pub world_data: Vec<u8>,
 }
-impl ServerPacket for FriendOnline { const ID: u8 = 0x16; }
+impl_server_packet!(FriendOnline, 0x16);
 
 /// `0x17` — a friend went offline.
 ///
@@ -217,7 +201,7 @@ impl ServerPacket for FriendOnline { const ID: u8 = 0x16; }
 pub struct FriendOffline {
     pub username: Str16,
 }
-impl ServerPacket for FriendOffline { const ID: u8 = 0x17; }
+impl_server_packet!(FriendOffline, 0x17);
 
 // ── Private message relay ─────────────────────────────────────────────────
 
@@ -231,7 +215,7 @@ pub struct RelayPrivateMsg {
     pub from:    Str16,
     pub message: Str16,
 }
-impl ServerPacket for RelayPrivateMsg { const ID: u8 = 0x1A; }
+impl_server_packet!(RelayPrivateMsg, 0x1A);
 
 // ── Session join signalling ───────────────────────────────────────────────
 
@@ -245,7 +229,7 @@ pub struct RelayJoinReq {
     pub from:       Str16,
     pub extra_byte: u8,
 }
-impl ServerPacket for RelayJoinReq { const ID: u8 = 0x2D; }
+impl_server_packet!(RelayJoinReq, 0x2D);
 
 /// `0x2B` (no payload) — sent to the **host** to clear its "Allowing…" UI popup.
 ///
@@ -254,7 +238,7 @@ impl ServerPacket for RelayJoinReq { const ID: u8 = 0x2D; }
 #[derive(Debug, Default)]
 #[bw(little)]
 pub struct JoinGrantHostClear;
-impl ServerPacket for JoinGrantHostClear { const ID: u8 = 0x2B; }
+impl_server_packet!(JoinGrantHostClear, 0x2B);
 
 /// `0x25` — P2P handoff packet sent to the **joiner** after a successful grant.
 ///
@@ -276,7 +260,7 @@ pub struct JumpToGame {
     pub port:          u16,
     pub password_flag: u8,
 }
-impl ServerPacket for JumpToGame { const ID: u8 = 0x25; }
+impl_server_packet!(JumpToGame, 0x25);
 
 /// `0x2E` — triggers the client's "report received" popup.
 ///
@@ -288,7 +272,7 @@ impl ServerPacket for JumpToGame { const ID: u8 = 0x25; }
 #[derive(Debug, Default)]
 #[bw(little)]
 pub struct ShowPopup;
-impl ServerPacket for ShowPopup { const ID: u8 = 0x2E; }
+impl_server_packet!(ShowPopup, 0x2E);
 
 /// `0x2F` — shows a warning overlay on the client.
 ///
@@ -304,7 +288,7 @@ impl ServerPacket for ShowPopup { const ID: u8 = 0x2E; }
 pub struct ShowWarning {
     pub code: u8,
 }
-impl ServerPacket for ShowWarning { const ID: u8 = 0x2F; }
+impl_server_packet!(ShowWarning, 0x2F);
 
 /// `0x34` — awards gems to the client.
 ///
@@ -319,4 +303,4 @@ impl ServerPacket for ShowWarning { const ID: u8 = 0x2F; }
 pub struct GiveGems {
     pub amount: i16,
 }
-impl ServerPacket for GiveGems { const ID: u8 = 0x34; }
+impl_server_packet!(GiveGems, 0x34);

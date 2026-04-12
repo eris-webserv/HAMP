@@ -1,16 +1,79 @@
 // packet.rs — wire primitives shared by both server types.
 //
-// ┌─ Wire helpers      pack_string / unpack_string / craft_batch / to_hex_upper
+// ┌─ ServerPacket      trait: any type sendable to a client (to_payload)
+// ├─ RawPacket         relay bytes verbatim as a ServerPacket
+// ├─ Wire helpers      pack_string / unpack_string / craft_batch / to_hex_upper
 // ├─ Str16             UTF-16LE length-prefixed string (BinRead + BinWrite)
 // ├─ PacketHeader      9-byte batch envelope + packet-ID byte
 // └─ Constants         DEFAULT_WORLD / LOGIN_SUCCESS_TRAILER
 //
 // Friend-server packets live in server::friend_server::packets_{client,server}.
-// Game-server packets live in server::game_server::packets.
+// Game-server packets live in server::game_server::packets_{client,server}.
 
 use std::io::Cursor;
 
 use binrw::binrw;
+
+// ── ServerPacket trait ─────────────────────────────────────────────────────
+//
+// Implemented by every S→C packet type in both servers.
+// Prevents accidentally passing a C→S (client-bound) type to send_to.
+//
+// For #[binwrite] structs, use the `impl_server_packet!` macro below.
+// For relay/raw packets, use `RawPacket`.
+
+pub trait ServerPacket {
+    /// Serialises this packet into wire bytes (packet-ID byte + field bytes).
+    fn to_payload(&self) -> Vec<u8>;
+}
+
+/// Forwards raw bytes verbatim as a `ServerPacket`.
+/// Used for relay packets where the server constructs the payload manually.
+pub struct RawPacket {
+    pub id:   u8,
+    pub body: Vec<u8>,
+}
+
+impl RawPacket {
+    pub fn new(id: u8, body: Vec<u8>) -> Self {
+        Self { id, body }
+    }
+}
+
+impl ServerPacket for RawPacket {
+    fn to_payload(&self) -> Vec<u8> {
+        let mut out = vec![self.id];
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+/// Allows an already-serialised `Vec<u8>` (including the ID byte) to be
+/// passed directly to `broadcast` / `send_to` without wrapping.
+impl ServerPacket for Vec<u8> {
+    fn to_payload(&self) -> Vec<u8> { self.clone() }
+}
+
+/// Generates a `ServerPacket` impl for a `#[binwrite]` struct.
+///
+/// ```ignore
+/// impl_server_packet!(MyPacket, 0x0A);
+/// ```
+#[macro_export]
+macro_rules! impl_server_packet {
+    ($ty:ty, $id:expr) => {
+        impl $crate::defs::packet::ServerPacket for $ty {
+            fn to_payload(&self) -> Vec<u8> {
+                let mut buf = vec![$id];
+                let mut cur = std::io::Cursor::new(Vec::<u8>::new());
+                binrw::BinWrite::write_le(self, &mut cur)
+                    .expect("ServerPacket serialisation failed");
+                buf.extend(cur.into_inner());
+                buf
+            }
+        }
+    };
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────
 

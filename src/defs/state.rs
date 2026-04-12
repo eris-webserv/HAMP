@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::utils::db::Db;
 use crate::defs::packet::{Str16, craft_batch, to_hex_upper};
-use crate::server::friend_server::packets_server::{FriendOffline, FriendOnline, ServerPacket};
+use crate::defs::packet::ServerPacket;
+use crate::server::friend_server::packets_server::{FriendOffline, FriendOnline};
+use crate::server::friend_server::server_registry::RegisteredServer;
 use crate::server::game_server::dummy_world::DummyWorld;
 
 // ── Session connection ─────────────────────────────────────────────────────
@@ -112,6 +114,10 @@ pub struct SharedState {
     /// session instead of spawning a new one — e.g. when joining someone who is
     /// already a guest in another player's world.
     pub active_relay_sessions: RwLock<HashMap<String, u16>>,
+    /// Live list of externally-registered public game servers.
+    /// Updated by the registry thread; read by the friend server handler.
+    /// Wrapped in its own Arc so the registry thread can hold a clone.
+    pub public_servers: Arc<RwLock<Vec<RegisteredServer>>>,
     /// The database — shared with every handler thread.
     pub db: Arc<Db>,
 }
@@ -123,6 +129,7 @@ impl SharedState {
             world_states:          RwLock::new(HashMap::new()),
             dummy_worlds:          RwLock::new(HashMap::new()),
             active_relay_sessions: RwLock::new(HashMap::new()),
+            public_servers:        Arc::new(RwLock::new(Vec::new())),
             db,
         })
     }
