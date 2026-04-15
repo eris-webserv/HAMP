@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "HAMP"
-version = "0.0.7-ALPHA3"
+version = "0.0.8"
 dependencies = [
  "base64",
  "binrw",
