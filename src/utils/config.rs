@@ -62,6 +62,11 @@ pub struct Config {
     /// restarts.  Has no effect once a save file already exists.
     pub world_seed: Option<u64>,
 
+    /// Whether PVP (player-vs-player damage) is enabled on this game server.
+    /// When false (default), `CombatControl$HitAllowed` blocks all player
+    /// damage on the client side.  Set to true to enable combat between players.
+    pub pvp_enabled: bool,
+
     // ── Friend-server registry (game server → friend server) ──────────────
     /// Hostname/IP of the friend server's registry listener.
     /// Leave empty to disable registry registration.
@@ -111,6 +116,7 @@ impl Default for Config {
             icons_dir:     "icons".to_string(),
             world_data_dir:"world_data".to_string(),
             world_seed:     None,
+            pvp_enabled:    false,
 
             friend_registry_host:   String::new(),
             friend_registry_port:   0,
@@ -211,6 +217,9 @@ world_data_dir = "world_data"
 # Optional fixed seed for world generation (u64).  Omit or set to 0 for a
 # random seed chosen at first startup.  Ignored if a save file already exists.
 # world_seed = 12345678
+
+# Enable player-vs-player combat (default: false).
+# pvp_enabled = false
 
 # ── Friend-server registry ──────────────────────────────────────────────────
 # Uncomment all three to have the game server register itself with a friend

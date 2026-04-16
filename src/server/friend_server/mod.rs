@@ -189,7 +189,18 @@ pub fn handle_packet(
 
         // ── REGISTER (0x0A) ────────────────────────────────────────────────
         // Creates a new account with a randomly generated token.
+        // Rich text tags are stripped from the username before any check so
+        // players cannot embed markup in names shown to others.
         ClientPacket::RegisterReq { username } => {
+            let username = crate::utils::text::strip_rich_text(&username);
+            let username = username.trim().to_string();
+            if username.is_empty() {
+                conn.send_pkt(
+                    &RegisterFail { name: Str16::new("") },
+                    "S->C [REG_FAIL]",
+                );
+                return;
+            }
             if state.db.player_exists(&username) {
                 conn.send_pkt(
                     &RegisterFail { name: Str16::new(&username) },
@@ -399,6 +410,7 @@ pub fn handle_packet(
                     .map(|p| p.username)
                     .unwrap_or_else(|| target_raw.clone());
 
+                let message = crate::utils::text::strip_rich_text(&message);
                 let target_conn = state.sessions.read().unwrap()
                     .get(&t)
                     .map(Arc::clone);

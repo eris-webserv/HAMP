@@ -117,6 +117,27 @@ impl ServerPacket for JoinConfirmed<'_> {
     }
 }
 
+// ── 0x05 PVP_STATE ────────────────────────────────────────────────────────
+//
+// S→C: [0x05][u8(pvp_enabled)][u8(0)]
+//
+// IDA confirmed (case 4 in GameServerReceiver$OnReceive):
+//   pvp_enabled = (byte == 1)
+//   Written to GameServerConnector::Instance.pvp_enabled.
+//   The second byte is read but ignored.
+//
+// Absence of this packet leaves pvp_enabled == false on the client, which
+// causes CombatControl$HitAllowed to block all player-vs-player damage.
+
+pub struct GamePvpState {
+    pub pvp_enabled: bool,
+}
+impl ServerPacket for GamePvpState {
+    fn to_payload(&self) -> Vec<u8> {
+        vec![0x05u8, self.pvp_enabled as u8, 0x00]
+    }
+}
+
 // ── 0x0B ZONE_DATA ────────────────────────────────────────────────────────
 //
 // Full zone-data packet including the ZoneData::UnpackFromWeb body.

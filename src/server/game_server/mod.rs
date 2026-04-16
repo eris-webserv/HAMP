@@ -42,7 +42,7 @@ use packets_client::{skip_basket_contents, GameClientPacket};
 use packets_server::{
     BasketUpdateBroadcast, BasketUpdateToHost, BeginMinigameRelay, ChatBroadcast,
     ChunkForGuest, ChunkRelayToHost, ContainerContents, ContainerRelayToHost,
-    DayNight, HeartbeatReply, JoinConfirmed, JoinNotif, LoginResponse,
+    DayNight, GamePvpState, HeartbeatReply, JoinConfirmed, JoinNotif, LoginResponse,
     MinigameChallengeRelay, MinigameResponseRelay, NamedRelayPacket, NoPrefixPacket,
     PlayerGone, PlayerNearby, PlayerPrefixPacket, Pong, PositionUpdate,
     UniqueIds, ZoneChangeBroadcast, ZoneData, ZoneForGuest, ZoneRelayToHost,
@@ -81,6 +81,9 @@ pub(crate) struct Session {
     mode:        SessionMode,
     players:     Mutex<HashMap<String, Arc<GamePlayer>>>,
     shutdown:    AtomicBool,
+    /// Whether player-vs-player combat is enabled. Sent to clients as packet
+    /// 0x05 during login so `CombatControl$HitAllowed` allows player damage.
+    pvp_enabled: bool,
     /// The address the listener is bound to — used to unblock the accept loop on shutdown.
     listen_addr: Mutex<Option<std::net::SocketAddr>>,
     /// The host player's username (relay mode only). The host client owns
@@ -93,10 +96,11 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    fn new(room_token: impl Into<String>, mode: SessionMode) -> Arc<Self> {
+    fn new(room_token: impl Into<String>, mode: SessionMode, pvp_enabled: bool) -> Arc<Self> {
         Arc::new(Self {
             room_token: room_token.into(),
             mode,
+            pvp_enabled,
             players: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             listen_addr: Mutex::new(None),
@@ -339,6 +343,11 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 // 3. S→C 0x02: join confirmed (is_host=true for host, false for guests)
                 let _ = write_payload(&mut stream, 2, &JoinConfirmed { server_name: &world, username: &uid, is_host: is_host_flag }.to_payload());
 
+                // 3b. S→C 0x05: PVP state — sets GameServerConnector.pvp_enabled on the
+                //     client.  Without this the client leaves pvp_enabled=false and
+                //     CombatControl$HitAllowed blocks all player damage.
+                let _ = write_payload(&mut stream, 2, &GamePvpState { pvp_enabled: session.pvp_enabled }.to_payload());
+
                 // 4. S→C 0x0B: zone data
                 let zone_name = match session.mode {
                     SessionMode::Managed(ref ws) => ws.default_zone.clone(),
@@ -374,10 +383,49 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     if raw.len() >= 8 {
                         let mut off = 0usize;
                         let pos_bytes = &raw[off..off + 8]; off += 8;
-                        let (zone_name, new_off) = unpack_string(raw, off); off = new_off;
+                        let (zone_name_raw, new_off) = unpack_string(raw, off); off = new_off;
                         let body_slot = if off < raw.len() { raw[off] } else { 0 }; off += 1;
 
                         let rest = if off < raw.len() { &raw[off..] } else { &[] };
+
+                        // In managed mode: validate the saved zone against the world's
+                        // zone list, then send ZoneData to teleport the client into it
+                        // if it differs from the default (which was sent at login).
+                        // Unknown zones (e.g. from a different world) fall back to default.
+                        let zone_name = if let SessionMode::Managed(ref ws) = session.mode {
+                            let known = !zone_name_raw.is_empty()
+                                && ws.generator.template().zones.iter()
+                                    .any(|z| z.name == zone_name_raw);
+                            let effective = if known {
+                                zone_name_raw.clone()
+                            } else {
+                                ws.default_zone.clone()
+                            };
+                            if effective != ws.default_zone {
+                                let _ = write_payload(&mut stream, 2,
+                                    &ZoneData { zone_name: &effective }.to_payload());
+                            }
+                            effective
+                        } else {
+                            zone_name_raw
+                        };
+
+                        // Update server-side TrackedPlayer with the position from 0x03.
+                        if let SessionMode::Managed(ref ws) = session.mode {
+                            use world_state::WorldPosition;
+                            let pos = WorldPosition {
+                                chunk_x: i16::from_le_bytes([pos_bytes[0], pos_bytes[1]]),
+                                chunk_z: i16::from_le_bytes([pos_bytes[2], pos_bytes[3]]),
+                                local_x: i16::from_le_bytes([pos_bytes[4], pos_bytes[5]]),
+                                local_z: i16::from_le_bytes([pos_bytes[6], pos_bytes[7]]),
+                            };
+                            let mut players = ws.players.write().unwrap();
+                            if let Some(tp) = players.get_mut(uid.as_str()) {
+                                tp.zone     = zone_name.clone();
+                                tp.position = pos;
+                                tp.target   = pos;
+                            }
+                        }
 
                         // Build OnlinePlayerData blob.
                         // OPD: at(8) + to(8) + rot(8) + is_dead(1) + Str(currently_using)
@@ -771,7 +819,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // RE: GSR case 6 reads [str player_id][str display_name][str msg][u8 type]
             0x06 => {
                 if let Some(ref uid) = player_id {
-                    let (msg, _) = unpack_string(data, 10);
+                    let (raw_msg, _) = unpack_string(data, 10);
+                    let msg = crate::utils::text::strip_rich_text(&raw_msg);
                     let mut pkt = vec![0x06u8];
                     pkt.extend(pack_string(uid));  // player_id
                     pkt.extend(pack_string(uid));  // display_name (same for now)
@@ -1623,7 +1672,7 @@ pub fn run(cfg: &Config) {
         });
     }
 
-    let session = Session::new(&cfg.server_name, SessionMode::Managed(Arc::clone(&world)));
+    let session = Session::new(&cfg.server_name, SessionMode::Managed(Arc::clone(&world)), cfg.pvp_enabled);
 
     // Optionally register with a friend server.
     if !cfg.friend_registry_host.is_empty()
@@ -1684,7 +1733,7 @@ pub fn spawn_relay_session(room_token: String, cfg: &Config) -> Option<u16> {
     for port in cfg.game_port..=cfg.game_port_max {
         let addr = format!("{}:{}", cfg.host, port);
         if let Ok(listener) = TcpListener::bind(&addr) {
-            let session = Session::new(room_token.clone(), SessionMode::Relay);
+            let session = Session::new(room_token.clone(), SessionMode::Relay, false);
             *session.listen_addr.lock().unwrap() = listener.local_addr().ok();
             let accept_session = Arc::clone(&session);
             println!("[GAME] Relay session '{}' → port {}", room_token, port);
