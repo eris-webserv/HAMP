@@ -666,20 +666,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── REQ_CONTAINER (0x1A) ──────────────────────────────────────
-            // C→S: [validator:Str][basket_id:i64][type:u8][chunk:Str][shorts×4]
-            // Relay mode: forward to host as 0x1C + String(requester) + Long(basket_id)
+            // C→S: [validator:Str][basket_id:u32][type:u8][chunk:Str][shorts×4]
+            // Relay mode: forward to host as 0x1C + String(requester) + u32(basket_id)
             //
-            // The host client also sends 0x1A when opening its own containers
-            // (despite ShouldSaveLocally=true). We must relay 0x1C back to the
-            // host so it loads from disk and responds with 0x1B.
+            // basket_id is a u32 (4 bytes), matching InventoryItem "long" property
+            // encoding which is also 4 bytes despite the name.
             0x1A => {
                 if let Some(ref uid) = player_id {
                     let (_, off) = unpack_string(data, 10); // skip validator
-                    if data.len() >= off + 8 {
-                        let basket_id = i64::from_le_bytes([
+                    if data.len() >= off + 4 {
+                        let basket_id = u32::from_le_bytes([
                             data[off], data[off+1], data[off+2], data[off+3],
-                            data[off+4], data[off+5], data[off+6], data[off+7],
-                        ]);
+                        ]) as i64;
 
                         if matches!(session.mode, SessionMode::Relay) {
                             let host = session.host.lock().unwrap().clone();
@@ -688,19 +686,15 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 session.pending_containers.lock().unwrap()
                                     .entry(bk).or_default().push(uid.clone());
 
-                                // Relay 0x1C to the host (works for both host-self
-                                // and guest requests — host loads from disk either way).
                                 let mut relay = vec![0x1Cu8];
                                 relay.extend(pack_string(uid));
-                                relay.extend_from_slice(&basket_id.to_le_bytes());
+                                relay.extend_from_slice(&(basket_id as u32).to_le_bytes());
                                 session.send_to(hname, &relay);
                             }
                         } else if let SessionMode::Managed(ref world) = session.mode {
-                            // Managed: load contents from server-side store and
-                            // reply immediately with S→C 0x1B.
                             let contents = world.baskets.get_contents(basket_id);
                             let mut out = vec![0x1Bu8];
-                            out.extend_from_slice(&basket_id.to_le_bytes());
+                            out.extend_from_slice(&(basket_id as u32).to_le_bytes());
                             out.extend_from_slice(&contents);
                             session.send_to(uid, &out);
                         }
@@ -709,22 +703,21 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── HOST CONTAINER RESPONSE (0x1B) — relay mode only ─────────
-            // Host sends: 0x1B + String(requester) + Long(basket_id) + BasketContents
-            // Guest expects: 0x1B + Long(basket_id) + BasketContents
+            // Host sends: 0x1B + String(requester) + u32(basket_id) + BasketContents
+            // Guest expects: 0x1B + u32(basket_id) + BasketContents
             0x1B if matches!(session.mode, SessionMode::Relay) => {
                 if let Some(ref uid) = player_id {
                     let is_host = session.host.lock().unwrap()
                         .as_ref().map(|h| h == uid).unwrap_or(false);
                     if is_host {
                         let (_requester, off) = unpack_string(data, 10);
-                        if data.len() >= off + 8 {
-                            let basket_id = i64::from_le_bytes([
+                        if data.len() >= off + 4 {
+                            let basket_id = u32::from_le_bytes([
                                 data[off], data[off+1], data[off+2], data[off+3],
-                                data[off+4], data[off+5], data[off+6], data[off+7],
-                            ]);
+                            ]) as i64;
 
                             let mut out = vec![0x1Bu8];
-                            out.extend_from_slice(&data[off..]); // basket_id + contents
+                            out.extend_from_slice(&data[off..]); // u32(basket_id) + contents
 
                             let bk = basket_id.to_string();
                             let targets = session.pending_containers.lock().unwrap()
@@ -738,15 +731,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── CLOSE_BASKET (0x1E) — relay to host in relay mode ────────
-            // C→S: [validator:Str][basket_id:i64][BasketContents][item_name:Str][chunk:Str][shorts×4]
-            // S→C: [basket_id:i64][BasketContents][item_name:Str] (broadcast, no trailing chunk/shorts)
+            // ── CLOSE_BASKET (0x1E) ───────────────────────────────────────
+            // C→S: [validator:Str][basket_id:u32][BasketContents][item_name:Str][chunk:Str][shorts×4]
+            // S→C: [basket_id:u32][BasketContents][item_name:Str] (no trailing chunk/shorts)
             0x1E => {
                 if let Some(ref uid) = player_id {
                     let (_, off) = unpack_string(data, 10); // skip validator
-                    // Parse through to find where item_name ends (exclude trailing chunk+shorts)
                     let basket_start = off;
-                    let after_basket_id = off + 8;
+                    let after_basket_id = off + 4; // basket_id is u32 (4 bytes)
                     let after_contents = skip_basket_contents(data, after_basket_id);
                     let (_item_name, after_item_name) = unpack_string(data, after_contents);
 
@@ -760,8 +752,6 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         let host = session.host.lock().unwrap().clone();
                         if let Some(ref hname) = host {
                             if uid != hname {
-                                // Send to host for persistence:
-                                // [0x1E] + String(requester) + basket_id + BasketContents + item_name
                                 let mut relay = vec![0x1Eu8];
                                 relay.extend(pack_string(uid));
                                 relay.extend_from_slice(&data[basket_start..after_item_name]);
@@ -769,14 +759,11 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             }
                         }
                     } else if let SessionMode::Managed(ref world) = session.mode {
-                        // Managed: persist to the server-side basket store.
                         if after_basket_id <= data.len() && after_contents <= data.len() {
-                            let basket_id = i64::from_le_bytes([
+                            let basket_id = u32::from_le_bytes([
                                 data[basket_start],     data[basket_start + 1],
                                 data[basket_start + 2], data[basket_start + 3],
-                                data[basket_start + 4], data[basket_start + 5],
-                                data[basket_start + 6], data[basket_start + 7],
-                            ]);
+                            ]) as i64;
                             let contents = &data[after_basket_id..after_contents];
                             world.baskets.put(basket_id, contents);
                         }

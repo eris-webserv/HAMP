@@ -29,7 +29,7 @@ use binrw::BinRead;
 /// Wire layout:
 ///   i16(short_prop_count) + [Str(key) + i16(val)] × count
 ///   i16(string_prop_count) + [Str(key) + Str(val)] × count
-///   i16(long_prop_count)  + [Str(key) + i32(val)] × count
+///   i16(long_prop_count)  + [Str(key) + i32(val)] × count  (despite the name, values are 32-bit)
 pub fn skip_inventory_item(data: &[u8], mut off: usize) -> usize {
     if off + 2 > data.len() { return off; }
     let count = u16::from_le_bytes([data[off], data[off + 1]]) as usize; off += 2;
