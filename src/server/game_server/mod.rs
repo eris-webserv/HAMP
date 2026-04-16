@@ -16,6 +16,7 @@
 // Add a match arm in `handle_client`. Most relayed packets just need an
 // entry in the bulk-relay arm at the bottom.
 
+pub mod baskets;
 pub mod generator;
 pub mod packets_client;
 pub mod packets_server;
@@ -694,8 +695,15 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 relay.extend_from_slice(&basket_id.to_le_bytes());
                                 session.send_to(hname, &relay);
                             }
+                        } else if let SessionMode::Managed(ref world) = session.mode {
+                            // Managed: load contents from server-side store and
+                            // reply immediately with S→C 0x1B.
+                            let contents = world.baskets.get_contents(basket_id);
+                            let mut out = vec![0x1Bu8];
+                            out.extend_from_slice(&basket_id.to_le_bytes());
+                            out.extend_from_slice(&contents);
+                            session.send_to(uid, &out);
                         }
-                        // Managed mode: containers not yet implemented
                     }
                 }
             }
@@ -759,6 +767,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 relay.extend_from_slice(&data[basket_start..after_item_name]);
                                 session.send_to(hname, &relay);
                             }
+                        }
+                    } else if let SessionMode::Managed(ref world) = session.mode {
+                        // Managed: persist to the server-side basket store.
+                        if after_basket_id <= data.len() && after_contents <= data.len() {
+                            let basket_id = i64::from_le_bytes([
+                                data[basket_start],     data[basket_start + 1],
+                                data[basket_start + 2], data[basket_start + 3],
+                                data[basket_start + 4], data[basket_start + 5],
+                                data[basket_start + 6], data[basket_start + 7],
+                            ]);
+                            let contents = &data[after_basket_id..after_contents];
+                            world.baskets.put(basket_id, contents);
                         }
                     }
                 }
@@ -1609,9 +1629,10 @@ pub fn run(cfg: &Config) {
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         eprintln!("[GAME] Warning: could not create world_data_dir {}: {}", data_dir.display(), e);
     }
-    let save_path = data_dir.join(persist::FILE_NAME);
+    let save_path    = data_dir.join(persist::FILE_NAME);
+    let baskets_path = data_dir.join(baskets::FILE_NAME);
 
-    let world = Arc::new(match persist::load(&save_path) {
+    let mut ws = match persist::load(&save_path) {
         Ok(ws) => {
             let chunk_count = ws.chunks.read().unwrap().len();
             println!("[GAME] Loaded world from {} ({} chunks)", save_path.display(), chunk_count);
@@ -1632,7 +1653,23 @@ pub fn run(cfg: &Config) {
             tmpl.seed = seed;
             WorldState::new("World", 5, tmpl)
         }
-    });
+    };
+
+    // Load baskets from their own file (independent of world.hws).
+    match baskets::load(&baskets_path) {
+        Ok(store) => {
+            println!("[GAME] Loaded {} baskets from {}", store.len(), baskets_path.display());
+            ws.baskets = store;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("[GAME] No basket file found — starting with empty store");
+        }
+        Err(e) => {
+            eprintln!("[GAME] Failed to load baskets ({}), starting fresh", e);
+        }
+    }
+
+    let world = Arc::new(ws);
 
     // Mutex shared between the SIGTERM handler and the background save thread
     // so they never write the world file concurrently (both write to a .tmp
@@ -1643,6 +1680,7 @@ pub fn run(cfg: &Config) {
     {
         let world_ref = Arc::clone(&world);
         let path      = save_path.clone();
+        let bpath     = baskets_path.clone();
         let lock      = Arc::clone(&save_lock);
         ctrlc::set_handler(move || {
             println!("[GAME] Shutdown signal — saving world...");
@@ -1650,6 +1688,10 @@ pub fn run(cfg: &Config) {
             match persist::save(&world_ref, &path) {
                 Ok(())  => println!("[GAME] World saved, exiting."),
                 Err(e)  => eprintln!("[GAME] Save failed on shutdown: {}", e),
+            }
+            match baskets::save(&world_ref.baskets, &bpath) {
+                Ok(())  => println!("[GAME] Baskets saved to {}", bpath.display()),
+                Err(e)  => eprintln!("[GAME] Basket save failed on shutdown: {}", e),
             }
             std::process::exit(0);
         }).unwrap_or_else(|e| eprintln!("[GAME] Warning: could not install signal handler: {}", e));
@@ -1659,6 +1701,7 @@ pub fn run(cfg: &Config) {
     {
         let world_ref = Arc::clone(&world);
         let path      = save_path.clone();
+        let bpath     = baskets_path.clone();
         let lock      = Arc::clone(&save_lock);
         std::thread::spawn(move || {
             loop {
@@ -1667,6 +1710,10 @@ pub fn run(cfg: &Config) {
                 match persist::save(&world_ref, &path) {
                     Ok(()) => println!("[GAME] World saved to {}", path.display()),
                     Err(e) => eprintln!("[GAME] Save failed: {}", e),
+                }
+                match baskets::save(&world_ref.baskets, &bpath) {
+                    Ok(()) => println!("[GAME] Baskets saved to {}", bpath.display()),
+                    Err(e) => eprintln!("[GAME] Basket save failed: {}", e),
                 }
             }
         });
@@ -1720,6 +1767,10 @@ pub fn run(cfg: &Config) {
     match persist::save(&world, &save_path) {
         Ok(()) => println!("[GAME] Final world save to {}", save_path.display()),
         Err(e) => eprintln!("[GAME] Final save failed: {}", e),
+    }
+    match baskets::save(&world.baskets, &baskets_path) {
+        Ok(()) => println!("[GAME] Final basket save to {}", baskets_path.display()),
+        Err(e) => eprintln!("[GAME] Final basket save failed: {}", e),
     }
 }
 

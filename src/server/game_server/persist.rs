@@ -43,6 +43,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::RwLock;
 
+use super::baskets::BasketStore;
 use super::generator::{BiomeWeights, WorldGenerator, WorldTemplate, ZoneConfig};
 use super::world_state::{Chunk, ChunkElement, WorldState};
 
@@ -226,6 +227,7 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
         default_zone,
         chunks:  RwLock::new(chunks),
         players: RwLock::new(HashMap::new()),
+        baskets: BasketStore::new(),
         generator:    WorldGenerator::new(template),
     })
 }

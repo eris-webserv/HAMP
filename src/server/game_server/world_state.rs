@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::defs::packet::pack_string;
+use crate::server::game_server::baskets::BasketStore;
 use crate::server::game_server::generator::{PlacedObject, WorldGenerator, WorldTemplate};
 
 // ── Position / rotation types ─────────────────────────────────────────────
@@ -190,6 +191,7 @@ pub struct WorldState {
     pub default_zone: String,
     pub chunks: RwLock<HashMap<(i16, i16), Chunk>>,
     pub players: RwLock<HashMap<String, TrackedPlayer>>,
+    pub baskets: BasketStore,
     pub(crate) generator: WorldGenerator,
 }
 
@@ -229,6 +231,7 @@ impl WorldState {
             default_zone,
             chunks: RwLock::new(chunks),
             players: RwLock::new(HashMap::new()),
+            baskets: BasketStore::new(),
             generator,
         }
     }
