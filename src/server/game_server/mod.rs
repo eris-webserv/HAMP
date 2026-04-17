@@ -25,10 +25,50 @@ pub mod registry_client;
 pub mod world_state;
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+// ── Packet logger ──────────────────────────────────────────────────────────
+
+static PKT_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+static PKT_LOG_CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pkt_log_file() -> &'static Mutex<std::fs::File> {
+    PKT_LOG.get_or_init(|| {
+        let f = OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open("latest.log")
+            .expect("cannot open latest.log");
+        Mutex::new(f)
+    })
+}
+
+/// Logs a single packet to `latest.log` (and console if `log_packets = true`).
+/// `direction` = "RECV" | "SEND" | "BCAST"
+/// `payload`   = `[pid, body...]`
+fn log_pkt(direction: &str, player: &str, payload: &[u8]) {
+    if payload.is_empty() { return; }
+    let pid = payload[0];
+    let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
+    let hex: String = payload.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+    let line = format!("[{}] {} player={} pid=0x{:02X} len={} hex={}\n",
+        ts, direction, player, pid, payload.len(), hex);
+    if let Ok(mut f) = pkt_log_file().lock() {
+        let _ = f.write_all(line.as_bytes());
+    }
+    if PKT_LOG_CONSOLE.load(Ordering::Relaxed) {
+        print!("[PKT] {}", line);
+    }
+}
+
+/// Send `payload` to `stream` and log it as S→C.
+fn gs_send(stream: &mut TcpStream, player: &str, payload: &[u8]) {
+    log_pkt("SEND", player, payload);
+    let _ = write_payload(stream, 2, payload);
+}
 
 /// Global allocator for unique object IDs.
 ///
@@ -98,8 +138,6 @@ pub(crate) struct Session {
     pending_chunks:     Mutex<HashMap<String, Vec<String>>>,
     /// Pending container requests: basket_id → list of requesting player usernames.
     pending_containers: Mutex<HashMap<String, Vec<String>>>,
-    /// Basket locking: basket_id → username of the player currently holding it open.
-    open_baskets: Mutex<HashMap<i64, (String, String)>>,
 }
 
 impl Session {
@@ -114,7 +152,6 @@ impl Session {
             host: Mutex::new(None),
             pending_chunks: Mutex::new(HashMap::new()),
             pending_containers: Mutex::new(HashMap::new()),
-            open_baskets: Mutex::new(HashMap::new()),
         })
     }
 
@@ -149,6 +186,7 @@ impl Session {
         let payload = pkt.to_payload();
         for (name, p) in self.players.lock().unwrap().iter() {
             if exclude == Some(name.as_str()) { continue; }
+            log_pkt("BCAST", name, &payload);
             let _ = write_payload(&mut *p.sink.lock().unwrap(), 2, &payload);
         }
     }
@@ -159,14 +197,17 @@ impl Session {
         for (name, p) in self.players.lock().unwrap().iter() {
             if exclude == Some(name.as_str()) { continue; }
             if *p.zone.lock().unwrap() != zone { continue; }
+            log_pkt("BCAST", name, &payload);
             let _ = write_payload(&mut *p.sink.lock().unwrap(), 2, &payload);
         }
     }
 
     /// Serialises `pkt` and sends it to a single player by username.
     fn send_to(&self, target: &str, pkt: &impl ServerPacket) {
+        let payload = pkt.to_payload();
+        log_pkt("SEND", target, &payload);
         if let Some(p) = self.players.lock().unwrap().get(target) {
-            let _ = write_payload(&mut *p.sink.lock().unwrap(), 2, &pkt.to_payload());
+            let _ = write_payload(&mut *p.sink.lock().unwrap(), 2, &payload);
         }
     }
 }
@@ -194,26 +235,6 @@ fn read_inventory_item(data: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     Some((data[start..off].to_vec(), off))
 }
 
-/// Rewrite the `currently_using` string inside a stored OPD blob.
-///
-/// OPD layout: pos(8) + pos(8) + rot(8) + is_dead(1) = 25-byte fixed header,
-/// followed immediately by pack_string(currently_using).
-///
-/// Pass `""` to clear (player not using anything), or a container key of the form
-/// `zone/chunkX/chunkZ/innerX/innerZ` to mark the player as using a basket.
-/// The client's `GameServerInterface.AnyoneUsing` compares nearby players'
-/// `currently_using` against this key to show the "in use" popup.
-fn opd_with_using(opd: &[u8], using_str: &str) -> Vec<u8> {
-    const HDR: usize = 25;
-    if opd.len() < HDR + 2 { return opd.to_vec(); }
-    let old_len = u16::from_le_bytes([opd[HDR], opd[HDR + 1]]) as usize;
-    let after_old = HDR + 2 + old_len;
-    let mut out = Vec::with_capacity(after_old + using_str.len() + (opd.len().saturating_sub(after_old)));
-    out.extend_from_slice(&opd[..HDR]);
-    out.extend(pack_string(using_str));
-    if after_old < opd.len() { out.extend_from_slice(&opd[after_old..]); }
-    out
-}
 
 // ── Per-client handler ─────────────────────────────────────────────────────
 
@@ -250,17 +271,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             if data.len() < 10 { continue; }
             let pid = data[9];
             let data = data.as_slice();
+            log_pkt("RECV", player_id.as_deref().unwrap_or(&addr.to_string()), &data[9..]);
 
         match pid {
 
             // ── PING (0x01) ────────────────────────────────────────────────
             0x01 => {
-                let _ = write_payload(&mut stream, 2, &[0x01]);
+                gs_send(&mut stream, player_id.as_deref().unwrap_or("?"), &[0x01]);
             }
 
             // ── HEARTBEAT (0x0F) ───────────────────────────────────────────
             0x0F => {
-                let _ = write_payload(&mut stream, 2, &[0x0F]);
+                gs_send(&mut stream, player_id.as_deref().unwrap_or("?"), &[0x0F]);
             }
 
             // ── LOGIN (0x26) ───────────────────────────────────────────────
@@ -346,30 +368,34 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
 
                 // 1. S→C 0x26: login response
-                let _ = write_payload(&mut stream, 2, &LoginResponse { world_name: &world, player_uid: &uid }.to_payload());
+                gs_send(&mut stream, &uid, &LoginResponse { world_name: &world, player_uid: &uid }.to_payload());
 
                 // 2. S→C 0x2A: unique IDs — allocate a per-player block from the global counter.
-                const INITIAL_ID_BLOCK: u16 = 25;
+                // Client exhausts (GoToMenu with "Unique IDs Exhausted") when the pool
+                // drops below 2, and asks for a refill when it drops below 16.  A
+                // 64-wide block gives plenty of headroom against placement bursts
+                // (e.g. rapid basket/container placement) and refill latency.
+                const INITIAL_ID_BLOCK: u16 = 64;
                 let id_start = NEXT_UNIQUE_ID.fetch_add(INITIAL_ID_BLOCK as i64, Ordering::Relaxed);
-                let _ = write_payload(&mut stream, 2, &UniqueIds { start: id_start, count: INITIAL_ID_BLOCK }.to_payload());
+                gs_send(&mut stream, &uid, &UniqueIds { start: id_start, count: INITIAL_ID_BLOCK }.to_payload());
 
                 // 3. S→C 0x02: join confirmed (is_host=true for host, false for guests)
-                let _ = write_payload(&mut stream, 2, &JoinConfirmed { server_name: &world, username: &uid, is_host: is_host_flag }.to_payload());
+                gs_send(&mut stream, &uid, &JoinConfirmed { server_name: &world, username: &uid, is_host: is_host_flag }.to_payload());
 
                 // 3b. S→C 0x05: PVP state — sets GameServerConnector.pvp_enabled on the
                 //     client.  Without this the client leaves pvp_enabled=false and
                 //     CombatControl$HitAllowed blocks all player damage.
-                let _ = write_payload(&mut stream, 2, &GamePvpState { pvp_enabled: session.pvp_enabled }.to_payload());
+                gs_send(&mut stream, &uid, &GamePvpState { pvp_enabled: session.pvp_enabled }.to_payload());
 
                 // 4. S→C 0x0B: zone data
                 let zone_name = match session.mode {
                     SessionMode::Managed(ref ws) => ws.default_zone.clone(),
                     SessionMode::Relay => "overworld".to_string(),
                 };
-                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone_name }.to_payload());
+                gs_send(&mut stream, &uid, &ZoneData { zone_name: &zone_name }.to_payload());
 
                 // 5. S→C 0x17: daynight
-                let _ = write_payload(&mut stream, 2, &DayNight { ms: 12000 }.to_payload());
+                gs_send(&mut stream, &uid, &DayNight { ms: 12000 }.to_payload());
 
                 // 6. S→C 0x07: join notification (broadcast to others)
                 session.broadcast(&JoinNotif { username: &uid, joined: true }, Some(uid.as_str()));
@@ -415,7 +441,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 ws.default_zone.clone()
                             };
                             if effective != ws.default_zone {
-                                let _ = write_payload(&mut stream, 2,
+                                gs_send(&mut stream, uid.as_str(),
                                     &ZoneData { zone_name: &effective }.to_payload());
                             }
                             effective
@@ -487,20 +513,6 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             for (name, init) in &existing {
                                 sess.send_to(&uid_owned, &PlayerNearby { username: name, display: name, opd: init }.to_payload());
                             }
-                            // For each existing player that has a basket open, send
-                            // 0x27 so the newcomer's AnyoneUsing (field+48) is set.
-                            let open: Vec<(String, String)> = sess.open_baskets.lock().unwrap()
-                                .values()
-                                .filter(|(holder, _)| holder != &uid_owned)
-                                .cloned()
-                                .collect();
-                            for (holder, key) in &open {
-                                sess.send_to(&uid_owned, &SetInteractingObject {
-                                    player:     holder,
-                                    object_key: key,
-                                }.to_payload());
-                            }
-
                             // 3. In relay mode, explicitly notify the host about
                             //    this guest so the host's client spawns them.
                             if matches!(sess.mode, SessionMode::Relay) {
@@ -535,7 +547,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             } else {
                                 zone_name
                             };
-                            let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone }.to_payload());
+                            gs_send(&mut stream, uid.as_str(), &ZoneData { zone_name: &zone }.to_payload());
                         }
                         SessionMode::Relay => {
                             let host = session.host.lock().unwrap().clone();
@@ -543,7 +555,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             if is_host {
                                 // Host gets zone data directly.
                                 let zone = if zone_name.is_empty() { "overworld".to_string() } else { zone_name };
-                                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone }.to_payload());
+                                gs_send(&mut stream, uid.as_str(), &ZoneData { zone_name: &zone }.to_payload());
                             } else if let Some(ref hname) = host {
                                 // Guest → relay to host.
                                 // Host expects: Str(zone_name) + Str(requester) + u8(type) [+ Pos if type 2|3]
@@ -579,7 +591,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         match session.mode {
                             SessionMode::Managed(ref world) => {
                                 let wire = world.get_chunk_wire(x, z);
-                                let _ = write_payload(&mut stream, 2, &wire);
+                                gs_send(&mut stream, uid.as_str(), &wire);
                             }
                             SessionMode::Relay => {
                                 let host = session.host.lock().unwrap().clone();
@@ -589,7 +601,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                     // but the client still sends 0x0C to the server.
                                     // Send back an empty chunk so it doesn't stall.
                                     let empty = world_state::Chunk::blank(x, z, &zone_name).to_wire();
-                                    let _ = write_payload(&mut stream, 2, &empty);
+                                    gs_send(&mut stream, uid.as_str(), &empty);
                                 } else if host.is_some() {
                                     // Guest → relay request to host.
                                     // Host expects: Str(requester) + Str(zone) + Str(sub_zone) + i16(x) + i16(z)
@@ -691,88 +703,37 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── REQ_CONTAINER (0x1A) ──────────────────────────────────────
-            // C→S: [validator:Str][basket_id:u32][type:u8][zone:Str]
-            //       [chunkX:i16][chunkZ:i16][innerX:i16][innerZ:i16]
-            // Relay mode: forward to host as 0x1C + String(requester) + u32(basket_id)
-            //
-            // basket_id is a u32 (4 bytes), matching InventoryItem "long" property
-            // encoding which is also 4 bytes despite the name.
-            //
-            // On success: update this player's OPD currently_using to the container
-            // key (zone/chunkX/chunkZ/innerX/innerZ) and broadcast PlayerNearby to
-            // others so their AnyoneUsing check returns true and shows the popup.
-            // On lock rejection: send the holder's OPD to the requester so they
-            // learn it's in use and close the connecting popup next tap.
+            // C→S: [validator:Str][basket_id:u32][type:u8][zone:Str][shorts×4]
+            // Relay: forward as 0x1C + String(requester) + u32(basket_id) to host.
+            //        If no host, respond with empty 0x1B.
+            // Managed: respond from BasketStore with 0x1B + u32(basket_id) + contents.
             0x1A => {
                 if let Some(ref uid) = player_id {
-                    let (_, mut off) = unpack_string(data, 10); // skip validator
+                    let (_, off) = unpack_string(data, 10); // skip validator
                     if data.len() >= off + 4 {
                         let basket_id = u32::from_le_bytes([
                             data[off], data[off+1], data[off+2], data[off+3],
                         ]) as i64;
-                        off += 4;
-                        off += 1; // skip type byte
-                        let (zone, mut off2) = unpack_string(data, off);
-                        let (chunkx, chunkz, innerx, innerz) = if data.len() >= off2 + 8 {
-                            let cx = i16::from_le_bytes([data[off2],   data[off2+1]]); off2 += 2;
-                            let cz = i16::from_le_bytes([data[off2],   data[off2+1]]); off2 += 2;
-                            let ix = i16::from_le_bytes([data[off2],   data[off2+1]]); off2 += 2;
-                            let iz = i16::from_le_bytes([data[off2],   data[off2+1]]);
-                            (cx, cz, ix, iz)
-                        } else {
-                            (0, 0, 0, 0)
-                        };
-                        let container_key = format!("{}/{}/{}/{}/{}", zone, chunkx, chunkz, innerx, innerz);
-
-                        // Basket locking: reject if already held by another player.
-                        let locked_by = {
-                            let mut locks = session.open_baskets.lock().unwrap();
-                            match locks.get(&basket_id).cloned() {
-                                Some((ref holder, _)) if holder != uid => Some(holder.clone()),
-                                None => { locks.insert(basket_id, (uid.clone(), container_key.clone())); None }
-                                _ => None, // same player re-opening
-                            }
-                        };
-
-                        if let Some(ref holder) = locked_by {
-                            // Basket is in use: send 0x27 to the requester so their
-                            // AnyoneUsing (field+48) check returns true and shows the popup.
-                            session.send_to(uid, &SetInteractingObject {
-                                player:     holder,
-                                object_key: &container_key,
-                            }.to_payload());
-                            continue;
-                        }
-
-                        // Lock acquired — update OPD and tell all zone peers via 0x27.
-                        let player_zone = session.players.lock().unwrap()
-                            .get(uid.as_str())
-                            .map(|p| p.zone.lock().unwrap().clone())
-                            .unwrap_or_default();
-                        if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
-                            let mut guard = p.initial_data.lock().unwrap();
-                            if let Some(ref od) = *guard {
-                                *guard = Some(opd_with_using(od, &container_key));
-                            }
-                        }
-                        // 0x27 sets field+48 on the client's OnlinePlayer — the field
-                        // that AnyoneUsing actually checks. Broadcast to all peers so
-                        // they see the basket as locked immediately.
-                        session.broadcast_zone(
-                            &SetInteractingObject { player: uid, object_key: &container_key },
-                            &player_zone, Some(uid.as_str()));
 
                         if matches!(session.mode, SessionMode::Relay) {
                             let host = session.host.lock().unwrap().clone();
-                            if let Some(ref hname) = host {
-                                let bk = basket_id.to_string();
-                                session.pending_containers.lock().unwrap()
-                                    .entry(bk).or_default().push(uid.clone());
-
-                                let mut relay = vec![0x1Cu8];
-                                relay.extend(pack_string(uid));
-                                relay.extend_from_slice(&(basket_id as u32).to_le_bytes());
-                                session.send_to(hname, &relay);
+                            match host {
+                                None => {
+                                    // No host yet — send empty container.
+                                    let mut out = vec![0x1Bu8];
+                                    out.extend_from_slice(&(basket_id as u32).to_le_bytes());
+                                    out.extend_from_slice(&[0u8, 0u8]); // slot_count = 0
+                                    session.send_to(uid, &out);
+                                }
+                                Some(ref hname) => {
+                                    let bk = basket_id.to_string();
+                                    session.pending_containers.lock().unwrap()
+                                        .entry(bk).or_default().push(uid.clone());
+                                    let mut relay = vec![0x1Cu8];
+                                    relay.extend(pack_string(uid));
+                                    relay.extend_from_slice(&(basket_id as u32).to_le_bytes());
+                                    session.send_to(hname, &relay);
+                                }
                             }
                         } else if let SessionMode::Managed(ref world) = session.mode {
                             let contents = world.baskets.get_contents(basket_id);
@@ -816,49 +777,26 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
             // ── CLOSE_BASKET (0x1E) ───────────────────────────────────────
             // C→S: [validator:Str][basket_id:u32][BasketContents][item_name:Str][chunk:Str][shorts×4]
-            // S→C: [basket_id:u32][BasketContents][item_name:Str] (no trailing chunk/shorts)
+            // Broadcast S→C 0x1E + u32(basket_id) + BasketContents + item_name to peers.
+            // Relay: also relay to host with requester prefix.
+            // Managed: save contents to BasketStore.
             0x1E => {
                 if let Some(ref uid) = player_id {
                     let (_, off) = unpack_string(data, 10); // skip validator
                     let basket_start = off;
-                    let after_basket_id = off + 4; // basket_id is u32 (4 bytes)
+                    let after_basket_id = off + 4;
+                    if after_basket_id > data.len() { continue; }
                     let after_contents = skip_basket_contents(data, after_basket_id);
-                    let (_item_name, after_item_name) = unpack_string(data, after_contents);
+                    let (_, after_item_name) = unpack_string(data, after_contents);
+                    let after_item_name = after_item_name.min(data.len());
 
-                    // Release basket lock and clear currently_using in this player's OPD,
-                    // then broadcast the updated OPD so nearby clients update AnyoneUsing.
-                    if after_basket_id <= data.len() {
-                        let lid = i64::from(u32::from_le_bytes([
-                            data[basket_start], data[basket_start+1],
-                            data[basket_start+2], data[basket_start+3],
-                        ]));
-                        session.open_baskets.lock().unwrap().remove(&lid);
-                    }
-                    let player_zone = session.players.lock().unwrap()
-                        .get(uid.as_str())
-                        .map(|p| p.zone.lock().unwrap().clone())
-                        .unwrap_or_default();
-                    {
-                        if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
-                            let mut guard = p.initial_data.lock().unwrap();
-                            if let Some(ref od) = *guard {
-                                *guard = Some(opd_with_using(od, ""));
-                            }
-                        }
-                    }
-                    // 0x28 clears field+48 on the client's OnlinePlayer so
-                    // AnyoneUsing stops blocking the basket for other players.
-                    session.broadcast_zone(
-                        &ReleaseInteractingObject { player: uid },
-                        &player_zone, Some(uid.as_str()));
-
-                    // Build S→C: basket_id + BasketContents + item_name (no trailing fields)
+                    // Broadcast to all peers (exclude sender).
                     let mut pkt = vec![0x1Eu8];
                     pkt.extend_from_slice(&data[basket_start..after_item_name]);
                     session.broadcast(&pkt, Some(uid.as_str()));
 
-                    // In relay mode, also forward save to host
                     if matches!(session.mode, SessionMode::Relay) {
+                        // Relay save to host (guest only).
                         let host = session.host.lock().unwrap().clone();
                         if let Some(ref hname) = host {
                             if uid != hname {
@@ -869,10 +807,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             }
                         }
                     } else if let SessionMode::Managed(ref world) = session.mode {
-                        if after_basket_id <= data.len() && after_contents <= data.len() {
+                        if after_contents <= data.len() {
                             let basket_id = u32::from_le_bytes([
-                                data[basket_start],     data[basket_start + 1],
-                                data[basket_start + 2], data[basket_start + 3],
+                                data[basket_start], data[basket_start+1],
+                                data[basket_start+2], data[basket_start+3],
                             ]) as i64;
                             let contents = &data[after_basket_id..after_contents];
                             world.baskets.put(basket_id, contents);
@@ -984,20 +922,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             &PlayerGone { username: uid }, &old_zone, Some(uid.as_str()));
                     }
 
-                    // Update player zone tracker. Clear currently_using because the
-                    // player left any open basket behind when they changed zones.
+                    // Update player zone tracker.
                     if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
                         *p.zone.lock().unwrap() = zone_name.clone();
-                        let mut guard = p.initial_data.lock().unwrap();
-                        if let Some(ref od) = *guard {
-                            *guard = Some(opd_with_using(od, ""));
-                        }
                     }
-                    // Release any basket lock and notify old-zone peers.
-                    session.open_baskets.lock().unwrap().retain(|_, (holder, _)| holder != uid);
-                    session.broadcast_zone(
-                        &ReleaseInteractingObject { player: uid },
-                        &old_zone, Some(uid.as_str()));
 
                     // Broadcast zone change to everyone (the client uses this
                     // for its own tracking regardless of visibility).
@@ -1060,14 +988,25 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── YOU_MAY_JOIN (0x2B) — relay to named target ───────────────
+            // ── USED_UNIQUE_ID (0x2B) ─────────────────────────────────────
+            // C→S from GameServerSender$$SendUsedUniqueId:
+            //   [0x2B][u32(used_id)]  (Packet.GetLong = 4 bytes)
+            //
+            // Server rebroadcasts to peers so they can drop the ID from their
+            // per-player tracking dict (case 0x2b in GameServerReceiver expects
+            // [Str(player)][u32(id)]).  No server-side tracking needed — our
+            // ID allocator hands out unique values globally.
+            //
+            // NOTE: 0x2B is YOU_MAY_JOIN on the *friend* server.  Do not confuse
+            // the two — on the game server it is strictly "used ID".
             0x2B => {
                 if let Some(ref uid) = player_id {
-                    let (target, off) = unpack_string(data, 10);
-                    let mut pkt = vec![0x2Bu8];
-                    pkt.extend(pack_string(uid));
-                    pkt.extend_from_slice(&data[off..]);
-                    session.send_to(&target, &pkt);
+                    if data.len() >= 10 + 4 {
+                        let mut pkt = vec![0x2Bu8];
+                        pkt.extend(pack_string(uid));
+                        pkt.extend_from_slice(&data[10..10 + 4]);
+                        session.broadcast(&pkt, Some(uid.as_str()));
+                    }
                 }
             }
 
@@ -1645,14 +1584,17 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── REQ_UNIQUE_IDS (0x29) — allocate another block of IDs ────
-            // Client sends this when its pool is running low.
-            // Respond with S→C 0x2A carrying a fresh range from the global counter.
+            // Client sends this (no payload, via GameServerSender$$RequestMoreUniqueIds)
+            // when its pool drops below 16.  Respond immediately with S→C 0x2A
+            // so the pool refills before it drops below 2 (which triggers the
+            // "Unique IDs Exhausted" disconnect client-side).
+            //
+            // Sent unconditionally — player_id isn't strictly required; some clients
+            // fire this during the handshake window before 0x26 completes.
             0x29 => {
-                if player_id.is_some() {
-                    const REFILL_BLOCK: u16 = 25;
-                    let id_start = NEXT_UNIQUE_ID.fetch_add(REFILL_BLOCK as i64, Ordering::Relaxed);
-                    let _ = write_payload(&mut stream, 2, &UniqueIds { start: id_start, count: REFILL_BLOCK }.to_payload());
-                }
+                const REFILL_BLOCK: u16 = 64;
+                let id_start = NEXT_UNIQUE_ID.fetch_add(REFILL_BLOCK as i64, Ordering::Relaxed);
+                gs_send(&mut stream, player_id.as_deref().unwrap_or("?"), &UniqueIds { start: id_start, count: REFILL_BLOCK }.to_payload());
             }
 
             // ── Host-originated S→C packets — relay as-is ─────────────
@@ -1696,10 +1638,6 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             .map(|p| p.zone.lock().unwrap().clone())
             .unwrap_or_default();
         session.players.lock().unwrap().remove(uid.as_str());
-        session.open_baskets.lock().unwrap().retain(|_, (holder, _)| holder != uid);
-        session.broadcast_zone(
-            &ReleaseInteractingObject { player: uid },
-            &player_zone, Some(uid.as_str()));
         session.broadcast(&PlayerGone { username: uid }, None);
         session.broadcast(&JoinNotif { username: uid, joined: false }, None);
 
@@ -1734,6 +1672,7 @@ pub fn run(cfg: &Config) {
     let listener = TcpListener::bind(&addr)
         .unwrap_or_else(|e| panic!("Failed to bind game server to {}: {}", addr, e));
     println!("[GAME] Standalone game server listening on {} ...", addr);
+    PKT_LOG_CONSOLE.store(cfg.log_packets, Ordering::Relaxed);
 
     let data_dir = std::path::PathBuf::from(&cfg.world_data_dir);
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -1897,6 +1836,7 @@ pub fn spawn_relay_session(room_token: String, cfg: &Config) -> Option<u16> {
             let session = Session::new(room_token.clone(), SessionMode::Relay, false);
             *session.listen_addr.lock().unwrap() = listener.local_addr().ok();
             let accept_session = Arc::clone(&session);
+            PKT_LOG_CONSOLE.store(cfg.log_packets, Ordering::Relaxed);
             println!("[GAME] Relay session '{}' → port {}", room_token, port);
             std::thread::spawn(move || {
                 for incoming in listener.incoming() {

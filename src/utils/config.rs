@@ -98,6 +98,9 @@ pub struct Config {
     /// Room token sent in the JumpToGame packet so the game server can
     /// identify the session. Leave empty to use a random token.
     pub server_room_token: String,
+
+    /// Mirror game-server packet log to the console (default: false).
+    pub log_packets: bool,
 }
 
 impl Default for Config {
@@ -129,6 +132,7 @@ impl Default for Config {
             server_max_players: 50,
             server_game_mode:   String::new(),
             server_room_token:  String::new(),
+            log_packets:        true,
         }
     }
 }
@@ -238,4 +242,8 @@ world_data_dir = "world_data"
 # server_max_players = 50
 # server_game_mode   = ""
 # server_room_token  = ""
+
+# ── Debugging ──────────────────────────────────────────────────────────────
+# Mirror game-server packet log to the console (also always written to latest.log).
+log_packets = true
 "#;
