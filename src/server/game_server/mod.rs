@@ -25,7 +25,7 @@ pub mod registry_client;
 pub mod world_state;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,8 +38,11 @@ use std::sync::{Arc, Mutex};
 static NEXT_UNIQUE_ID: AtomicI64 = AtomicI64::new(1_000_000);
 
 use crate::utils::config::Config;
+#[allow(unused_imports)]
 use crate::defs::packet::{craft_batch, pack_string, unpack_string, write_payload, ServerPacket};
+#[allow(unused_imports)]
 use packets_client::{skip_basket_contents, GameClientPacket};
+#[allow(unused_imports)]
 use packets_server::{
     BasketUpdateBroadcast, BasketUpdateToHost, BeginMinigameRelay, ChatBroadcast,
     ChunkForGuest, ChunkRelayToHost, ContainerContents, ContainerRelayToHost,

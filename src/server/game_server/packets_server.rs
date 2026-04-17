@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // packets_server.rs — S→C game-server packet definitions.
 //
 // Every type here implements `ServerPacket` from `defs::packet`, which
@@ -17,6 +18,7 @@
 // `RawPacket` is available for any packet where the server constructs the
 // payload manually and just needs type-safe forwarding.
 
+#[allow(unused_imports)]
 pub use crate::defs::packet::{RawPacket, ServerPacket};
 use crate::defs::packet::pack_string;
 

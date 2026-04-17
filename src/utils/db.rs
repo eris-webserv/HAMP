@@ -20,6 +20,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 
 /// Minimal player record returned from the `players` table.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PlayerRow {
     pub username:     String,
     pub token:        String,

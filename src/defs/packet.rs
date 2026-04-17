@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // packet.rs — wire primitives shared by both server types.
 //
 // ┌─ ServerPacket      trait: any type sendable to a client (to_payload)

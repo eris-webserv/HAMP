@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // packets_client.rs — C→S game-server packet definitions.
 //
 // `GameClientPacket` covers every packet a client may send to the game server.

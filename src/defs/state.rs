@@ -1,7 +1,6 @@
 // state.rs — shared runtime state and broadcast helpers.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, RwLock};
 

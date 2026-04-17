@@ -16,6 +16,7 @@
 use binrw::binwrite;
 
 use crate::defs::packet::Str16;
+#[allow(unused_imports)]
 pub use crate::defs::packet::ServerPacket;
 use crate::impl_server_packet;
 

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // packets_client.rs — C→S packet definitions.
 //
 // `ClientPacket` covers every packet type a client can legitimately send.
