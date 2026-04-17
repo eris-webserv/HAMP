@@ -46,6 +46,7 @@ use packets_server::{
     DayNight, GamePvpState, HeartbeatReply, JoinConfirmed, JoinNotif, LoginResponse,
     MinigameChallengeRelay, MinigameResponseRelay, NamedRelayPacket, NoPrefixPacket,
     PlayerGone, PlayerNearby, PlayerPrefixPacket, Pong, PositionUpdate,
+    ReleaseInteractingObject, SetInteractingObject,
     UniqueIds, ZoneChangeBroadcast, ZoneData, ZoneForGuest, ZoneRelayToHost,
 };
 use world_state::WorldState;
@@ -94,6 +95,8 @@ pub(crate) struct Session {
     pending_chunks:     Mutex<HashMap<String, Vec<String>>>,
     /// Pending container requests: basket_id → list of requesting player usernames.
     pending_containers: Mutex<HashMap<String, Vec<String>>>,
+    /// Basket locking: basket_id → username of the player currently holding it open.
+    open_baskets: Mutex<HashMap<i64, (String, String)>>,
 }
 
 impl Session {
@@ -108,6 +111,7 @@ impl Session {
             host: Mutex::new(None),
             pending_chunks: Mutex::new(HashMap::new()),
             pending_containers: Mutex::new(HashMap::new()),
+            open_baskets: Mutex::new(HashMap::new()),
         })
     }
 
@@ -187,18 +191,23 @@ fn read_inventory_item(data: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     Some((data[start..off].to_vec(), off))
 }
 
-/// Rewrite the zone string inside a stored OPD blob.
+/// Rewrite the `currently_using` string inside a stored OPD blob.
 ///
-/// OPD layout: pos(8) + pos(8) + rot(8) + appearance(1) = 25-byte fixed header,
-/// followed immediately by pack_string(zone_name).
-fn opd_with_zone(opd: &[u8], zone: &str) -> Vec<u8> {
+/// OPD layout: pos(8) + pos(8) + rot(8) + is_dead(1) = 25-byte fixed header,
+/// followed immediately by pack_string(currently_using).
+///
+/// Pass `""` to clear (player not using anything), or a container key of the form
+/// `zone/chunkX/chunkZ/innerX/innerZ` to mark the player as using a basket.
+/// The client's `GameServerInterface.AnyoneUsing` compares nearby players'
+/// `currently_using` against this key to show the "in use" popup.
+fn opd_with_using(opd: &[u8], using_str: &str) -> Vec<u8> {
     const HDR: usize = 25;
     if opd.len() < HDR + 2 { return opd.to_vec(); }
-    let old_zone_len = u16::from_le_bytes([opd[HDR], opd[HDR + 1]]) as usize;
-    let after_old = HDR + 2 + old_zone_len;
-    let mut out = Vec::with_capacity(after_old + zone.len() + (opd.len().saturating_sub(after_old)));
+    let old_len = u16::from_le_bytes([opd[HDR], opd[HDR + 1]]) as usize;
+    let after_old = HDR + 2 + old_len;
+    let mut out = Vec::with_capacity(after_old + using_str.len() + (opd.len().saturating_sub(after_old)));
     out.extend_from_slice(&opd[..HDR]);
-    out.extend(pack_string(zone));
+    out.extend(pack_string(using_str));
     if after_old < opd.len() { out.extend_from_slice(&opd[after_old..]); }
     out
 }
@@ -438,8 +447,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         opd.extend_from_slice(pos_bytes);                    // at position
                         opd.extend_from_slice(pos_bytes);                    // to position (same)
                         opd.extend_from_slice(&[0, 0, 0, 0, 0, 0, 100, 0]); // rotation: identity quat ×100
-                        opd.push(body_slot);                                 // appearance slot
-                        opd.extend(pack_string(&zone_name));                 // zone_name (client uses this for placement)
+                        opd.push(body_slot);                                 // is_dead byte (0 = alive)
+                        opd.extend(pack_string(""));                         // currently_using (empty = not using anything)
                         opd.extend(pack_string(""));                         // sitting_in_chair
                         opd.extend_from_slice(rest);                         // level + items + hp + creatures
 
@@ -474,6 +483,19 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 .collect();
                             for (name, init) in &existing {
                                 sess.send_to(&uid_owned, &PlayerNearby { username: name, display: name, opd: init }.to_payload());
+                            }
+                            // For each existing player that has a basket open, send
+                            // 0x27 so the newcomer's AnyoneUsing (field+48) is set.
+                            let open: Vec<(String, String)> = sess.open_baskets.lock().unwrap()
+                                .values()
+                                .filter(|(holder, _)| holder != &uid_owned)
+                                .cloned()
+                                .collect();
+                            for (holder, key) in &open {
+                                sess.send_to(&uid_owned, &SetInteractingObject {
+                                    player:     holder,
+                                    object_key: key,
+                                }.to_payload());
                             }
 
                             // 3. In relay mode, explicitly notify the host about
@@ -666,18 +688,76 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── REQ_CONTAINER (0x1A) ──────────────────────────────────────
-            // C→S: [validator:Str][basket_id:u32][type:u8][chunk:Str][shorts×4]
+            // C→S: [validator:Str][basket_id:u32][type:u8][zone:Str]
+            //       [chunkX:i16][chunkZ:i16][innerX:i16][innerZ:i16]
             // Relay mode: forward to host as 0x1C + String(requester) + u32(basket_id)
             //
             // basket_id is a u32 (4 bytes), matching InventoryItem "long" property
             // encoding which is also 4 bytes despite the name.
+            //
+            // On success: update this player's OPD currently_using to the container
+            // key (zone/chunkX/chunkZ/innerX/innerZ) and broadcast PlayerNearby to
+            // others so their AnyoneUsing check returns true and shows the popup.
+            // On lock rejection: send the holder's OPD to the requester so they
+            // learn it's in use and close the connecting popup next tap.
             0x1A => {
                 if let Some(ref uid) = player_id {
-                    let (_, off) = unpack_string(data, 10); // skip validator
+                    let (_, mut off) = unpack_string(data, 10); // skip validator
                     if data.len() >= off + 4 {
                         let basket_id = u32::from_le_bytes([
                             data[off], data[off+1], data[off+2], data[off+3],
                         ]) as i64;
+                        off += 4;
+                        off += 1; // skip type byte
+                        let (zone, mut off2) = unpack_string(data, off);
+                        let (chunkx, chunkz, innerx, innerz) = if data.len() >= off2 + 8 {
+                            let cx = i16::from_le_bytes([data[off2],   data[off2+1]]); off2 += 2;
+                            let cz = i16::from_le_bytes([data[off2],   data[off2+1]]); off2 += 2;
+                            let ix = i16::from_le_bytes([data[off2],   data[off2+1]]); off2 += 2;
+                            let iz = i16::from_le_bytes([data[off2],   data[off2+1]]);
+                            (cx, cz, ix, iz)
+                        } else {
+                            (0, 0, 0, 0)
+                        };
+                        let container_key = format!("{}/{}/{}/{}/{}", zone, chunkx, chunkz, innerx, innerz);
+
+                        // Basket locking: reject if already held by another player.
+                        let locked_by = {
+                            let mut locks = session.open_baskets.lock().unwrap();
+                            match locks.get(&basket_id).cloned() {
+                                Some((ref holder, _)) if holder != uid => Some(holder.clone()),
+                                None => { locks.insert(basket_id, (uid.clone(), container_key.clone())); None }
+                                _ => None, // same player re-opening
+                            }
+                        };
+
+                        if let Some(ref holder) = locked_by {
+                            // Basket is in use: send 0x27 to the requester so their
+                            // AnyoneUsing (field+48) check returns true and shows the popup.
+                            session.send_to(uid, &SetInteractingObject {
+                                player:     holder,
+                                object_key: &container_key,
+                            }.to_payload());
+                            continue;
+                        }
+
+                        // Lock acquired — update OPD and tell all zone peers via 0x27.
+                        let player_zone = session.players.lock().unwrap()
+                            .get(uid.as_str())
+                            .map(|p| p.zone.lock().unwrap().clone())
+                            .unwrap_or_default();
+                        if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
+                            let mut guard = p.initial_data.lock().unwrap();
+                            if let Some(ref od) = *guard {
+                                *guard = Some(opd_with_using(od, &container_key));
+                            }
+                        }
+                        // 0x27 sets field+48 on the client's OnlinePlayer — the field
+                        // that AnyoneUsing actually checks. Broadcast to all peers so
+                        // they see the basket as locked immediately.
+                        session.broadcast_zone(
+                            &SetInteractingObject { player: uid, object_key: &container_key },
+                            &player_zone, Some(uid.as_str()));
 
                         if matches!(session.mode, SessionMode::Relay) {
                             let host = session.host.lock().unwrap().clone();
@@ -741,6 +821,33 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     let after_basket_id = off + 4; // basket_id is u32 (4 bytes)
                     let after_contents = skip_basket_contents(data, after_basket_id);
                     let (_item_name, after_item_name) = unpack_string(data, after_contents);
+
+                    // Release basket lock and clear currently_using in this player's OPD,
+                    // then broadcast the updated OPD so nearby clients update AnyoneUsing.
+                    if after_basket_id <= data.len() {
+                        let lid = i64::from(u32::from_le_bytes([
+                            data[basket_start], data[basket_start+1],
+                            data[basket_start+2], data[basket_start+3],
+                        ]));
+                        session.open_baskets.lock().unwrap().remove(&lid);
+                    }
+                    let player_zone = session.players.lock().unwrap()
+                        .get(uid.as_str())
+                        .map(|p| p.zone.lock().unwrap().clone())
+                        .unwrap_or_default();
+                    {
+                        if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
+                            let mut guard = p.initial_data.lock().unwrap();
+                            if let Some(ref od) = *guard {
+                                *guard = Some(opd_with_using(od, ""));
+                            }
+                        }
+                    }
+                    // 0x28 clears field+48 on the client's OnlinePlayer so
+                    // AnyoneUsing stops blocking the basket for other players.
+                    session.broadcast_zone(
+                        &ReleaseInteractingObject { player: uid },
+                        &player_zone, Some(uid.as_str()));
 
                     // Build S→C: basket_id + BasketContents + item_name (no trailing fields)
                     let mut pkt = vec![0x1Eu8];
@@ -874,15 +981,20 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             &PlayerGone { username: uid }, &old_zone, Some(uid.as_str()));
                     }
 
-                    // Update player zone tracker and the stored OPD zone string
-                    // so late-joiners see the correct zone after a zone transition.
+                    // Update player zone tracker. Clear currently_using because the
+                    // player left any open basket behind when they changed zones.
                     if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
                         *p.zone.lock().unwrap() = zone_name.clone();
                         let mut guard = p.initial_data.lock().unwrap();
                         if let Some(ref od) = *guard {
-                            *guard = Some(opd_with_zone(od, &zone_name));
+                            *guard = Some(opd_with_using(od, ""));
                         }
                     }
+                    // Release any basket lock and notify old-zone peers.
+                    session.open_baskets.lock().unwrap().retain(|_, (holder, _)| holder != uid);
+                    session.broadcast_zone(
+                        &ReleaseInteractingObject { player: uid },
+                        &old_zone, Some(uid.as_str()));
 
                     // Broadcast zone change to everyone (the client uses this
                     // for its own tracking regardless of visibility).
@@ -1576,7 +1688,15 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
     // Disconnect cleanup: remove player and notify others via 0x13 type=gone + 0x07 leave.
     if let Some(ref uid) = player_id {
+        let player_zone = session.players.lock().unwrap()
+            .get(uid.as_str())
+            .map(|p| p.zone.lock().unwrap().clone())
+            .unwrap_or_default();
         session.players.lock().unwrap().remove(uid.as_str());
+        session.open_baskets.lock().unwrap().retain(|_, (holder, _)| holder != uid);
+        session.broadcast_zone(
+            &ReleaseInteractingObject { player: uid },
+            &player_zone, Some(uid.as_str()));
         session.broadcast(&PlayerGone { username: uid }, None);
         session.broadcast(&JoinNotif { username: uid, joined: false }, None);
 

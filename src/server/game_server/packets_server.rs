@@ -55,10 +55,11 @@ impl ServerPacket for LoginResponse<'_> {
 
 // ── 0x2A UNIQUE_IDS ───────────────────────────────────────────────────────
 //
-// S→C: [0x2A][i16(count)][i64 × count]
+// S→C: [0x2A][i16(count)][u32 × count]
 //
 // IDA confirmed: case 41 in GameServerReceiver reads GetShort(count) then
-// count × GetLong, adding each to ConstructionControl.online_unique_ids_.
+// count × GetLong (= System_BitConverter__ToInt32, i.e. 4 bytes each) adding
+// each to ConstructionControl.online_unique_ids_.
 // Sets requesting_unique_ids=0 when done.
 //
 // The packet ID is 0x2A, NOT 0x29.  0x29 (case 40) is a different flow:
@@ -77,7 +78,8 @@ impl ServerPacket for UniqueIds {
         let mut p = vec![0x2Au8];
         p.extend_from_slice(&self.count.to_le_bytes());
         for i in 0..self.count {
-            p.extend_from_slice(&(self.start + i as i64).to_le_bytes());
+            // GetLong = System_BitConverter__ToInt32: reads 4 bytes, not 8
+            p.extend_from_slice(&((self.start + i as i64) as u32).to_le_bytes());
         }
         p
     }
@@ -479,6 +481,53 @@ impl ServerPacket for BeginMinigameRelay<'_> {
         let mut p = vec![0x37u8];
         p.extend(pack_string(self.sender));
         p.extend_from_slice(self.rest);
+        p
+    }
+}
+
+// ── 0x27 SET_INTERACTING ─────────────────────────────────────────────────
+//
+// S→C: [0x27][Str(player)][Str(object_key)]
+//
+// IDA confirmed (case 38 in GameServerReceiver):
+//   v701 = GetString()  // player username
+//   v702 = GetString()  // container key ("zone/cx/cz/ix/iz")
+//   *(_QWORD *)(nearby_player + 48) = v702   // sets field+48
+//
+// This is what AnyoneUsing checks — NOT currently_using (field+32 in OPD).
+// Broadcast to all zone peers when a player opens a basket so their
+// AnyoneUsing returns true and shows the "in use" popup.
+
+pub struct SetInteractingObject<'a> {
+    pub player:     &'a str,
+    pub object_key: &'a str,
+}
+impl ServerPacket for SetInteractingObject<'_> {
+    fn to_payload(&self) -> Vec<u8> {
+        let mut p = vec![0x27u8];
+        p.extend(pack_string(self.player));
+        p.extend(pack_string(self.object_key));
+        p
+    }
+}
+
+// ── 0x28 RELEASE_INTERACTING ─────────────────────────────────────────────
+//
+// S→C: [0x28][Str(player)]
+//
+// IDA confirmed (case 39 in GameServerReceiver):
+//   v1111 = GetString()  // player username
+//   *(_QWORD *)(nearby_player + 48) = ""    // clears field+48
+//
+// Broadcast to all zone peers when a player closes a basket.
+
+pub struct ReleaseInteractingObject<'a> {
+    pub player: &'a str,
+}
+impl ServerPacket for ReleaseInteractingObject<'_> {
+    fn to_payload(&self) -> Vec<u8> {
+        let mut p = vec![0x28u8];
+        p.extend(pack_string(self.player));
         p
     }
 }

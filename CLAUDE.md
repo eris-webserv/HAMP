@@ -1,27 +1,13 @@
 # HAMP — Project Notes
 
-## Game session types
+## The fuck is this?
+This is a reimplementation of the friend server / game server for a game called Hybrid Animals. The old servers have long since shut down, so we have to rely on reverse engineering the client. How tedius.
 
-There are two distinct session types. Do not conflate them:
+## So what should I know?
+- If your user is smart, they'll have provided either a Ghidra or IDA MCP server. Make liberal use of it if you must. It's the oracle for the game's decompiled source. Mind you, this game is an Android game compiled with IL2CPP, so all we have to go off of is whatever IDA makes of the machine code file. Again, if your user is smart, they'll have applied the assisting scripts from Il2CPPDumper or Il2CPPInspector so you can search for function names.
+- The goal of this is a fully reimplemented version of this game's Friend Server and Game Server with whatever tasteful features (display names, administrators, server bans) that we want to add.
 
-### Dummy worlds (relay sessions)
-- Used exclusively by the **friend server** for player-to-player joining.
-- When player A grants player B's join request, the friend server spawns a
-  relay session (`spawn_relay_session`). The host client owns all world data;
-  the server just forwards packets between players.
-- No server-side world state — chunks, containers, etc. are served by the
-  host client.
+## Things to note
 
-### Admin-spawned game servers (managed sessions)
-- Standalone game servers with server-owned world state (`WorldState`).
-- Spawned via admin terminal (`startworld`) on a spoofed user.
-- The server serves chunks, tracks positions, and will eventually persist
-  world state to disk (not yet implemented).
-- Players connect the same way (JoinReq → auto-accept → JumpToGame) but the
-  server handles everything — no host client involved.
-
-### Future: world state persistence
-Admin-spawned managed servers should eventually save/load world state (chunks,
-containers, placed objects) to disk. This is not yet implemented. When adding
-it, follow the Python reference implementation's approach of per-chunk JSON
-files and a `_containers.json` for basket contents.
+- Yes, Packet.GetLong does read 4 bytes. I know it's stupid, but it does. :(
+- There are two server types: the Game Server, and Friend Server as stated. The Friend Server's packet handler is FriendServerReceiver__OnReceive, and the Game Server's is GameServerReceiver__OnReceive.
