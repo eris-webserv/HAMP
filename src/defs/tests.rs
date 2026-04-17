@@ -123,3 +123,35 @@ fn craft_batch_total_len_matches() {
     let total_len = u16::from_le_bytes([out[0], out[1]]) as usize;
     assert_eq!(total_len, out.len());
 }
+
+// ── Packet-dump fixtures ────────────────────────────────────────────────────
+//
+// Exact wire bytes captured from a live server session (node-sulfur, 2026-04-17).
+// Tests here assert our encoding is byte-identical to what the production
+// server sends so client regressions fail at compile-time, not in-game.
+
+// S→C heartbeat reply: craft_batch(qid=2, payload=[0x0F])
+// Captured: [S->C [HB]] 0A00010203010000000F
+#[test]
+fn heartbeat_sc_frame_exact() {
+    let frame = craft_batch(0x02, &[0x0F]);
+    assert_eq!(
+        frame,
+        &[0x0A, 0x00, 0x01, 0x02, 0x03, 0x01, 0x00, 0x00, 0x00, 0x0F],
+        "S→C heartbeat frame doesn't match live capture"
+    );
+}
+
+// C→S heartbeat uses qid=3, not 2 — verify the frame is otherwise identical.
+// Captured: [C->S] [HEARTBEAT] 0A00010303010000000F
+#[test]
+fn heartbeat_cs_frame_differs_by_qid() {
+    let cs = &[0x0A, 0x00, 0x01, 0x03, 0x03, 0x01, 0x00, 0x00, 0x00, 0x0Fu8];
+    // total_len, magic, payload_len, packet_id all match S→C; only qid differs
+    assert_eq!(cs[3], 0x03, "C→S qid should be 3");
+    assert_eq!(cs[9], 0x0F, "C→S heartbeat packet ID should be 0x0F");
+    // Our outgoing heartbeat must use qid=2, not 3
+    let sc = craft_batch(0x02, &[0x0F]);
+    assert_eq!(sc[3], 0x02, "S→C qid must be 2");
+    assert_ne!(&sc[..], cs, "S→C and C→S frames must differ");
+}

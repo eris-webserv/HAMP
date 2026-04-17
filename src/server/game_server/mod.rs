@@ -46,7 +46,7 @@ use packets_client::{skip_basket_contents, GameClientPacket};
 use packets_server::{
     BasketUpdateBroadcast, BasketUpdateToHost, BeginMinigameRelay, ChatBroadcast,
     ChunkForGuest, ChunkRelayToHost, ContainerContents, ContainerRelayToHost,
-    DayNight, GamePvpState, HeartbeatReply, JoinConfirmed, JoinNotif, LoginResponse,
+    DayNight, HeartbeatReply, JoinConfirmed, JoinNotif, LoginResponse, SessionInit,
     MinigameChallengeRelay, MinigameResponseRelay, NamedRelayPacket, NoPrefixPacket,
     PlayerGone, PlayerNearby, PlayerPrefixPacket, Pong, PositionUpdate,
     ReleaseInteractingObject, SetInteractingObject,
@@ -356,10 +356,17 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 // 3. S→C 0x02: join confirmed (is_host=true for host, false for guests)
                 let _ = write_payload(&mut stream, 2, &JoinConfirmed { server_name: &world, username: &uid, is_host: is_host_flag }.to_payload());
 
-                // 3b. S→C 0x05: PVP state — sets GameServerConnector.pvp_enabled on the
-                //     client.  Without this the client leaves pvp_enabled=false and
-                //     CombatControl$HitAllowed blocks all player damage.
-                let _ = write_payload(&mut stream, 2, &GamePvpState { pvp_enabled: session.pvp_enabled }.to_payload());
+                // 3b. S→C 0x05: session init — compound packet containing daynight,
+                //     companion limit, saved-position skip flag, and PVP state.
+                //     Sending uid_count=0 and perk_count=0 skips those loops.
+                //     skip_saved_pos=1 prevents the client from overriding our
+                //     zone spawn with a server-saved position.
+                let _ = write_payload(&mut stream, 2, &SessionInit {
+                    daynight_ms:    12000,
+                    client_is_mod:  false,
+                    max_companions: 3,
+                    pvp_enabled:    session.pvp_enabled,
+                }.to_payload());
 
                 // 4. S→C 0x0B: zone data
                 let zone_name = match session.mode {
@@ -367,9 +374,6 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     SessionMode::Relay => "overworld".to_string(),
                 };
                 let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone_name }.to_payload());
-
-                // 5. S→C 0x17: daynight
-                let _ = write_payload(&mut stream, 2, &DayNight { ms: 12000 }.to_payload());
 
                 // 6. S→C 0x07: join notification (broadcast to others)
                 session.broadcast(&JoinNotif { username: &uid, joined: true }, Some(uid.as_str()));
@@ -693,7 +697,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // ── REQ_CONTAINER (0x1A) ──────────────────────────────────────
             // C→S: [validator:Str][basket_id:u32][type:u8][zone:Str]
             //       [chunkX:i16][chunkZ:i16][innerX:i16][innerZ:i16]
-            // Relay mode: forward to host as 0x1C + String(requester) + u32(basket_id)
+            // Relay mode: forward to host as 0x1B + String(requester) + u32(basket_id)
+            // Host responds with 0x1B + String(requester) + u32(basket_id) + BasketContents
+            // Server strips requester and forwards as 0x1A + u32(basket_id) + BasketContents
+            // Managed mode: respond immediately with 0x1A + u32(basket_id) + BasketContents
             //
             // basket_id is a u32 (4 bytes), matching InventoryItem "long" property
             // encoding which is also 4 bytes despite the name.
@@ -769,14 +776,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 session.pending_containers.lock().unwrap()
                                     .entry(bk).or_default().push(uid.clone());
 
-                                let mut relay = vec![0x1Cu8];
+                                let mut relay = vec![0x1Bu8];
                                 relay.extend(pack_string(uid));
                                 relay.extend_from_slice(&(basket_id as u32).to_le_bytes());
                                 session.send_to(hname, &relay);
                             }
                         } else if let SessionMode::Managed(ref world) = session.mode {
                             let contents = world.baskets.get_contents(basket_id);
-                            let mut out = vec![0x1Bu8];
+                            let mut out = vec![0x1Au8];
                             out.extend_from_slice(&(basket_id as u32).to_le_bytes());
                             out.extend_from_slice(&contents);
                             session.send_to(uid, &out);
@@ -787,7 +794,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
             // ── HOST CONTAINER RESPONSE (0x1B) — relay mode only ─────────
             // Host sends: 0x1B + String(requester) + u32(basket_id) + BasketContents
-            // Guest expects: 0x1B + u32(basket_id) + BasketContents
+            // Guest expects: 0x1A + u32(basket_id) + BasketContents  (same ID as the request)
             0x1B if matches!(session.mode, SessionMode::Relay) => {
                 if let Some(ref uid) = player_id {
                     let is_host = session.host.lock().unwrap()
@@ -799,7 +806,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 data[off], data[off+1], data[off+2], data[off+3],
                             ]) as i64;
 
-                            let mut out = vec![0x1Bu8];
+                            let mut out = vec![0x1Au8];
                             out.extend_from_slice(&data[off..]); // u32(basket_id) + contents
 
                             let bk = basket_id.to_string();

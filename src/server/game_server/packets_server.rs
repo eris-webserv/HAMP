@@ -121,24 +121,41 @@ impl ServerPacket for JoinConfirmed<'_> {
     }
 }
 
-// ── 0x05 PVP_STATE ────────────────────────────────────────────────────────
+// ── 0x05 SESSION_INIT ─────────────────────────────────────────────────────
 //
-// S→C: [0x05][u8(pvp_enabled)][u8(0)]
+// IDA confirmed (case 4 in GameServerReceiver$$OnReceive).  This is a
+// compound packet — the receiver reads all of the following in order:
 //
-// IDA confirmed (case 4 in GameServerReceiver$OnReceive):
-//   pvp_enabled = (byte == 1)
-//   Written to GameServerConnector::Instance.pvp_enabled.
-//   The second byte is read but ignored.
-//
-// Absence of this packet leaves pvp_enabled == false on the client, which
-// causes CombatControl$HitAllowed to block all player-vs-player damage.
+//   [0x05]
+//   i16  uid_count          — extra unique IDs to add to client pool (we use 0)
+//   i32  × uid_count        — GetLong each
+//   i16  daynight_ms        — consumed by ReceiveDaynight (time of day in ms)
+//   i16  disabled_perk_count
+//   Str  × disabled_perk_count
+//   u8   client_is_mod      — sets GameServerConnector.is_moderator
+//   u8   max_companions     — sets CompanionController.max_personal_companions_right_now
+//   u8   skip_saved_pos     — 0 = client requests its saved zone/position; 1 = skip
+//   u8   pvp_enabled        — sets GameServerConnector.pvp_enabled
+//   u8   padding            — GetByte, ignored
 
-pub struct GamePvpState {
-    pub pvp_enabled: bool,
+pub struct SessionInit {
+    pub daynight_ms:    i16,
+    pub client_is_mod:  bool,
+    pub max_companions: u8,
+    pub pvp_enabled:    bool,
 }
-impl ServerPacket for GamePvpState {
+impl ServerPacket for SessionInit {
     fn to_payload(&self) -> Vec<u8> {
-        vec![0x05u8, self.pvp_enabled as u8, 0x00]
+        let mut p = vec![0x05u8];
+        p.extend_from_slice(&0i16.to_le_bytes()); // uid_count = 0
+        p.extend_from_slice(&self.daynight_ms.to_le_bytes());
+        p.extend_from_slice(&0i16.to_le_bytes()); // disabled_perk_count = 0
+        p.push(self.client_is_mod as u8);
+        p.push(self.max_companions);
+        p.push(0x01); // skip_saved_pos = 1 → don't override our spawn via zone packets
+        p.push(self.pvp_enabled as u8);
+        p.push(0x00); // padding
+        p
     }
 }
 
@@ -582,5 +599,233 @@ impl ServerPacket for NamedRelayPacket<'_> {
         p.extend(pack_string(self.name));
         p.extend_from_slice(self.body);
         p
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+//
+// Each test simulates the client-side parser so that a wrong encoding fails
+// here rather than silently misbehaving in game.  The helpers mirror the
+// actual IL2CPP methods:
+//
+//   GetByte  → read 1 byte
+//   GetShort → System_BitConverter__ToInt16 → 2 bytes LE
+//   GetLong  → System_BitConverter__ToInt32 → 4 bytes LE  (NOT 8!)
+//   GetString→ GetShort(len) + len bytes
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Client-side parser primitives ─────────────────────────────────────
+
+    fn get_byte(buf: &[u8], off: usize) -> (u8, usize) {
+        (buf[off], off + 1)
+    }
+
+    fn get_short(buf: &[u8], off: usize) -> (i16, usize) {
+        let v = i16::from_le_bytes([buf[off], buf[off + 1]]);
+        (v, off + 2)
+    }
+
+    // GetLong = System_BitConverter__ToInt32: reads only 4 bytes.
+    fn get_long(buf: &[u8], off: usize) -> (i32, usize) {
+        let v = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+        (v, off + 4)
+    }
+
+    // GetString: GetShort(byte_len) + byte_len bytes of UTF-16LE.
+    fn get_string(buf: &[u8], off: usize) -> (String, usize) {
+        let (byte_len, off) = get_short(buf, off);
+        let byte_len = byte_len as usize;
+        let u16s: Vec<u16> = buf[off..off + byte_len]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        (String::from_utf16(&u16s).unwrap(), off + byte_len)
+    }
+
+    // ── 0x01 Pong ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn pong_is_single_byte() {
+        let p = Pong.to_payload();
+        assert_eq!(p, vec![0x01]);
+    }
+
+    // ── 0x2A UniqueIds ────────────────────────────────────────────────────
+    //
+    // Case 41: GetShort(count) then count × GetLong (= 4 bytes each).
+    // Regression test for the original 8-byte-per-ID bug.
+
+    #[test]
+    fn unique_ids_encodes_as_u32_not_u64() {
+        let pkt = UniqueIds { start: 1000, count: 3 }.to_payload();
+        assert_eq!(pkt[0], 0x2A);
+        let (count, mut off) = get_short(&pkt, 1);
+        assert_eq!(count, 3);
+        for i in 0..3i32 {
+            let (id, next) = get_long(&pkt, off);
+            assert_eq!(id, 1000 + i, "id[{i}] wrong");
+            off = next;
+        }
+        assert_eq!(off, pkt.len(), "trailing bytes after IDs");
+    }
+
+    #[test]
+    fn unique_ids_wraps_at_u32_boundary() {
+        // IDs near u32::MAX should wrap, not overflow into 8 bytes.
+        let start = u32::MAX as i64 - 1;
+        let pkt = UniqueIds { start, count: 2 }.to_payload();
+        let (_, mut off) = get_short(&pkt, 1);
+        let (id0, next) = get_long(&pkt, off); off = next;
+        let (id1, _)    = get_long(&pkt, off);
+        assert_eq!(id0 as u32, (start) as u32);
+        assert_eq!(id1 as u32, (start + 1) as u32);
+    }
+
+    // ── 0x26 LoginResponse ────────────────────────────────────────────────
+    //
+    // Case 37: GetShort(zone_trail_count=0), GetString(world), GetString(uid), GetByte(zone_type).
+
+    #[test]
+    fn login_response_layout() {
+        let pkt = LoginResponse { world_name: "TestWorld", player_uid: "alice" }.to_payload();
+        assert_eq!(pkt[0], 0x26);
+        let (trail, off) = get_short(&pkt, 1);
+        assert_eq!(trail, 0);
+        let (world, off) = get_string(&pkt, off);
+        assert_eq!(world, "TestWorld");
+        let (uid, off) = get_string(&pkt, off);
+        assert_eq!(uid, "alice");
+        let (zone_type, off) = get_byte(&pkt, off);
+        assert_eq!(zone_type, 0);
+        assert_eq!(off, pkt.len());
+    }
+
+    // ── 0x02 JoinConfirmed ────────────────────────────────────────────────
+    //
+    // Case 1: GetString(server), GetByte(is_host), GetByte(pvp),
+    //         GetString(validator), GetShort(validator_var), GetShort(n_others).
+
+    #[test]
+    fn join_confirmed_layout() {
+        let pkt = JoinConfirmed { server_name: "MySrv", username: "bob", is_host: true }.to_payload();
+        assert_eq!(pkt[0], 0x02);
+        let (srv, off)  = get_string(&pkt, 1);
+        assert_eq!(srv, "MySrv");
+        let (host, off) = get_byte(&pkt, off);
+        assert_eq!(host, 1);
+        let (pvp, off)  = get_byte(&pkt, off);
+        assert_eq!(pvp, 0);
+        let (val, off)  = get_string(&pkt, off);
+        assert_eq!(val, "bob");
+        let (var, off)  = get_short(&pkt, off);
+        assert_eq!(var, 0);
+        let (n, off)    = get_short(&pkt, off);
+        assert_eq!(n, 0);
+        assert_eq!(off, pkt.len());
+    }
+
+    // ── 0x07 JoinNotif ────────────────────────────────────────────────────
+    //
+    // Case 6: GetString(uid), GetString(display), GetByte(joined).
+
+    #[test]
+    fn join_notif_layout() {
+        let pkt = JoinNotif { username: "carol", joined: false }.to_payload();
+        assert_eq!(pkt[0], 0x07);
+        let (uid, off)  = get_string(&pkt, 1);
+        let (disp, off) = get_string(&pkt, off);
+        let (join, off) = get_byte(&pkt, off);
+        assert_eq!(uid, "carol");
+        assert_eq!(disp, "carol");
+        assert_eq!(join, 0);
+        assert_eq!(off, pkt.len());
+    }
+
+    // ── 0x13 PlayerGone ───────────────────────────────────────────────────
+    //
+    // Case 18: GetByte(type=0), GetString(uid), GetByte(mob_count).
+
+    #[test]
+    fn player_gone_layout() {
+        let pkt = PlayerGone { username: "dave" }.to_payload();
+        assert_eq!(pkt[0], 0x13);
+        let (kind, off) = get_byte(&pkt, 1);
+        assert_eq!(kind, 0);
+        let (uid, off)  = get_string(&pkt, off);
+        assert_eq!(uid, "dave");
+        let (mobs, off) = get_byte(&pkt, off);
+        assert_eq!(mobs, 0);
+        assert_eq!(off, pkt.len());
+    }
+
+    // ── 0x27 SetInteractingObject ─────────────────────────────────────────
+    //
+    // Case 38: GetString(player), GetString(object_key) → *(player+48) = key.
+
+    #[test]
+    fn set_interacting_layout() {
+        let pkt = SetInteractingObject {
+            player:     "eve",
+            object_key: "overworld/1/2/3/4",
+        }.to_payload();
+        assert_eq!(pkt[0], 0x27);
+        let (player, off) = get_string(&pkt, 1);
+        let (key, off)    = get_string(&pkt, off);
+        assert_eq!(player, "eve");
+        assert_eq!(key, "overworld/1/2/3/4");
+        assert_eq!(off, pkt.len());
+    }
+
+    // ── 0x28 ReleaseInteractingObject ─────────────────────────────────────
+    //
+    // Case 39: GetString(player) → *(player+48) = "".
+
+    #[test]
+    fn release_interacting_layout() {
+        let pkt = ReleaseInteractingObject { player: "eve" }.to_payload();
+        assert_eq!(pkt[0], 0x28);
+        let (player, off) = get_string(&pkt, 1);
+        assert_eq!(player, "eve");
+        assert_eq!(off, pkt.len());
+    }
+
+    // ── 0x05 SessionInit ──────────────────────────────────────────────────
+    //
+    // Verify the compound structure so a future refactor can't accidentally
+    // break the receiver's sequential reads.
+
+    #[test]
+    fn session_init_layout() {
+        let pkt = SessionInit {
+            daynight_ms:    12000,
+            client_is_mod:  false,
+            max_companions: 3,
+            pvp_enabled:    true,
+        }.to_payload();
+        let mut off = 0;
+        assert_eq!(pkt[off], 0x05); off += 1;
+        // uid_count = 0
+        let uid_count = get_short(&pkt, off); off += 2;
+        assert_eq!(uid_count.0, 0);
+        // daynight_ms
+        let daynight = get_short(&pkt, off); off += 2;
+        assert_eq!(daynight.0, 12000);
+        // disabled_perk_count = 0
+        let perk_count = get_short(&pkt, off); off += 2;
+        assert_eq!(perk_count.0, 0);
+        // client_is_mod, max_companions, skip_saved_pos, pvp, padding
+        let (is_mod,  off) = get_byte(&pkt, off);
+        let (max_cmp, off) = get_byte(&pkt, off);
+        let (skip,    off) = get_byte(&pkt, off);
+        let (pvp,     off) = get_byte(&pkt, off);
+        let (_pad,    off) = get_byte(&pkt, off);
+        assert_eq!(is_mod,  0);
+        assert_eq!(max_cmp, 3);
+        assert_eq!(skip,    1); // must be non-zero so client skips saved-position request
+        assert_eq!(pvp,     1);
+        assert_eq!(off, pkt.len());
     }
 }

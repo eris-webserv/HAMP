@@ -69,17 +69,43 @@ impl Db {
         ).ok()
     }
 
-    /// Returns the display name for `username`, falling back to `username`
-    /// itself if none has been set.
+    /// Returns the effective display name for `username`, falling back to
+    /// `username` itself if none has been set.  Moderator accounts are
+    /// automatically wrapped in `<i>…★</i>` Unity Rich Text.
     pub fn get_display_name(&self, username: &str) -> String {
         let conn = self.0.lock().unwrap();
-        conn.query_row(
-            "SELECT display_name FROM players WHERE username = ?1",
+        let row = conn.query_row(
+            "SELECT display_name, COALESCE(is_moderator, 0) FROM players WHERE username = ?1",
             params![username],
-            |row| row.get::<_, Option<String>>(0),
-        ).ok()
-            .flatten()
-            .unwrap_or_else(|| username.to_string())
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        ).ok();
+        let (raw, is_mod) = match row {
+            Some((r, m)) => (r.unwrap_or_else(|| username.to_string()), m != 0),
+            None         => (username.to_string(), false),
+        };
+        if is_mod { format!("<i>{}★</i>", raw) } else { raw }
+    }
+
+    #[allow(dead_code)]
+    /// Returns `true` if `username` has the moderator flag set.
+    pub fn is_moderator(&self, username: &str) -> bool {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(is_moderator, 0) FROM players WHERE username = ?1",
+            params![username],
+            |row| row.get::<_, i64>(0),
+        ).ok().map(|v| v != 0).unwrap_or(false)
+    }
+
+    /// Sets or clears the moderator flag for `username`.
+    /// Returns `false` if the player does not exist.
+    pub fn set_moderator(&self, username: &str, value: bool) -> bool {
+        if !self.player_exists(username) { return false; }
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE players SET is_moderator = ?1 WHERE username = ?2",
+            params![value as i64, username],
+        ).map(|n| n > 0).unwrap_or(false)
     }
 
     /// Sets a custom display name for `username`.
@@ -330,6 +356,7 @@ impl Db {
 /// v1 → v2: drop the `display` column; add `COLLATE NOCASE` to the primary
 ///           key so lookups are case-insensitive while storing chosen casing.
 /// v2 → v3: add `display_name TEXT` column for cosmetic names.
+/// v3 → v4: add `is_moderator INTEGER NOT NULL DEFAULT 0`.
 fn migrate(conn: &Connection) -> SqlResult<()> {
     let cols: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(players)")?;
@@ -369,6 +396,15 @@ fn migrate(conn: &Connection) -> SqlResult<()> {
         println!("[DB] Migration v2→v3 complete.");
     }
 
+    // v3 → v4: add is_moderator flag.
+    if !cols.iter().any(|c| c == "is_moderator") {
+        println!("[DB] Migrating schema v3→v4: adding is_moderator column …");
+        conn.execute_batch(
+            "ALTER TABLE players ADD COLUMN is_moderator INTEGER NOT NULL DEFAULT 0;"
+        )?;
+        println!("[DB] Migration v3→v4 complete.");
+    }
+
     Ok(())
 }
 
@@ -378,7 +414,8 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS players (
     username     TEXT PRIMARY KEY COLLATE NOCASE,
     token        TEXT NOT NULL,
-    display_name TEXT
+    display_name TEXT,
+    is_moderator INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS friends (

@@ -305,3 +305,64 @@ pub struct GiveGems {
     pub amount: i16,
 }
 impl_server_packet!(GiveGems, 0x34);
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+//
+// Byte-exact fixtures captured from a live server session (node-sulfur,
+// 2026-04-17).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::packet::ServerPacket;
+
+    // S→C JUMP_TO_GAME_PUBLIC (0x25) — exact payload bytes from live capture.
+    //
+    // ILuv joined "Sparring Grounds" at 01:43:09.
+    // Full frame hex: 6F00010203660000002520005300...A51E00
+    // Decoded: display="Sparring Grounds", token="spr",
+    //          host_ip="150.136.106.170", mode="45.8.201.48",
+    //          port=7845, password_flag=0x00
+    #[test]
+    fn jump_to_game_exact() {
+        let pkt = JumpToGame {
+            display:       Str16::new("Sparring Grounds"),
+            token:         Str16::new("spr"),
+            host_ip:       Str16::new("150.136.106.170"),
+            mode:          Str16::new("45.8.201.48"),
+            port:          7845,
+            password_flag: 0x00,
+        }.to_payload();
+
+        let expected = &[
+            0x25u8,
+            // "Sparring Grounds" — 16 chars × 2 = 32 bytes
+            0x20, 0x00,
+            0x53,0x00,0x70,0x00,0x61,0x00,0x72,0x00,0x72,0x00,0x69,0x00,
+            0x6E,0x00,0x67,0x00,0x20,0x00,0x47,0x00,0x72,0x00,0x6F,0x00,
+            0x75,0x00,0x6E,0x00,0x64,0x00,0x73,0x00,
+            // "spr" — 3 chars × 2 = 6 bytes
+            0x06, 0x00, 0x73,0x00,0x70,0x00,0x72,0x00,
+            // "150.136.106.170" — 15 chars × 2 = 30 bytes
+            0x1E, 0x00,
+            0x31,0x00,0x35,0x00,0x30,0x00,0x2E,0x00,0x31,0x00,0x33,0x00,
+            0x36,0x00,0x2E,0x00,0x31,0x00,0x30,0x00,0x36,0x00,0x2E,0x00,
+            0x31,0x00,0x37,0x00,0x30,0x00,
+            // "45.8.201.48" — 11 chars × 2 = 22 bytes
+            0x16, 0x00,
+            0x34,0x00,0x35,0x00,0x2E,0x00,0x38,0x00,0x2E,0x00,0x32,0x00,
+            0x30,0x00,0x31,0x00,0x2E,0x00,0x34,0x00,0x38,0x00,
+            // port = 7845 = 0x1EA5 LE, password_flag = 0
+            0xA5, 0x1E, 0x00,
+        ];
+
+        assert_eq!(pkt, expected, "JumpToGame payload doesn't match live capture");
+    }
+
+    // HeartbeatReply payload is just the packet ID — no fields.
+    // Captured as the last byte of the S→C heartbeat frame.
+    #[test]
+    fn heartbeat_reply_payload() {
+        assert_eq!(HeartbeatReply.to_payload(), &[0x0F]);
+    }
+}

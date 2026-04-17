@@ -143,6 +143,7 @@ fn dispatch(cmd: &str, args: &str, adm: &mut AdminSession, state: &Arc<SharedSta
         "recv"    => cmd_recv(adm, state, args),
         "check"      => cmd_check(state, args),
         "setdisplay" => cmd_setdisplay(state, args),
+        "setmod"     => cmd_setmod(state, args),
         "fixdb"      => cmd_fixdb(state),
         "reports"    => cmd_reports(state),
         "db"         => cmd_db(state, args),
@@ -426,6 +427,25 @@ fn cmd_setdisplay(state: &SharedState, args: &str) -> String {
     }
 }
 
+fn cmd_setmod(state: &SharedState, args: &str) -> String {
+    let mut parts = args.splitn(2, ' ');
+    let user = match parts.next().filter(|s| !s.is_empty()) {
+        Some(u) => u,
+        None    => return "Usage: setmod <user> <on|off>\n".to_string(),
+    };
+    let flag = match parts.next().map(str::trim) {
+        Some("on"  | "1" | "true")  => true,
+        Some("off" | "0" | "false") => false,
+        _ => return "Usage: setmod <user> <on|off>\n".to_string(),
+    };
+    if state.db.set_moderator(user, flag) {
+        let status = if flag { "granted" } else { "revoked" };
+        format!("Moderator status {} for '{}'.\n", status, user)
+    } else {
+        format!("[!] Player '{}' not found.\n", user)
+    }
+}
+
 fn cmd_help() -> String {
     "\
 Commands:\n\
@@ -440,6 +460,7 @@ Commands:\n\
   recv <hex>                 — feed a raw client packet to the spoofed user\n\
   check <user>               — inspect a player's friends/pending state\n\
   setdisplay <user> [name]   — set (or clear) a cosmetic display name\n\
+  setmod <user> <on|off>     — grant or revoke moderator status (italic name + ★)\n\
   fixdb                      — clean up stale pending requests\n\
   reports                    — list all player reports\n\
   db <base64-sql>            — run a raw SQL query against the database\n\
