@@ -45,7 +45,7 @@ use std::sync::RwLock;
 
 use super::baskets::BasketStore;
 use super::generator::{BiomeWeights, WorldGenerator, WorldTemplate, ZoneConfig};
-use super::world_state::{Chunk, ChunkElement, WorldState};
+use super::world_state::{Chunk, ChunkElement, WorldState, ZoneEntry};
 
 const MAGIC: &[u8; 4] = b"HAMP";
 const VERSION: u8 = 1;
@@ -228,6 +228,11 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
         chunks:  RwLock::new(chunks),
         players: RwLock::new(HashMap::new()),
         baskets: BasketStore::new(),
+        zones: {
+            let wgen = WorldGenerator::new(template.clone());
+            let map = wgen.template_zones().map(|n| (n.to_string(), ZoneEntry::plain())).collect();
+            RwLock::new(map)
+        },
         generator:    WorldGenerator::new(template),
     })
 }

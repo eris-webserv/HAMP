@@ -127,7 +127,7 @@ impl ServerPacket for JoinConfirmed<'_> {
 // compound packet — the receiver reads all of the following in order:
 //
 //   [0x05]
-//   i16  uid_count          — extra unique IDs to add to client pool (we use 0)
+//   i16  uid_count          — unique IDs to add to client's online_unique_ids_ pool
 //   i32  × uid_count        — GetLong each
 //   i16  daynight_ms        — consumed by ReceiveDaynight (time of day in ms)
 //   i16  disabled_perk_count
@@ -136,49 +136,85 @@ impl ServerPacket for JoinConfirmed<'_> {
 //   u8   max_companions     — sets CompanionController.max_personal_companions_right_now
 //   u8   skip_saved_pos     — 0 = client requests its saved zone/position; 1 = skip
 //   u8   pvp_enabled        — sets GameServerConnector.pvp_enabled
-//   u8   padding            — GetByte, ignored
+//   u8   padding            — GetByte, discarded
 
 pub struct SessionInit {
     pub daynight_ms:    i16,
     pub client_is_mod:  bool,
     pub max_companions: u8,
     pub pvp_enabled:    bool,
+    pub uid_start:      i64,
+    pub uid_count:      u16,
 }
 impl ServerPacket for SessionInit {
     fn to_payload(&self) -> Vec<u8> {
         let mut p = vec![0x05u8];
-        p.extend_from_slice(&0i16.to_le_bytes()); // uid_count = 0
+        p.extend_from_slice(&(self.uid_count as i16).to_le_bytes());
+        for i in 0..self.uid_count {
+            p.extend_from_slice(&((self.uid_start + i as i64) as u32).to_le_bytes());
+        }
         p.extend_from_slice(&self.daynight_ms.to_le_bytes());
         p.extend_from_slice(&0i16.to_le_bytes()); // disabled_perk_count = 0
         p.push(self.client_is_mod as u8);
         p.push(self.max_companions);
         p.push(0x01); // skip_saved_pos = 1 → don't override our spawn via zone packets
         p.push(self.pvp_enabled as u8);
-        p.push(0x00); // padding
+        p.push(0x00); // padding — GetByte, discarded
         p
     }
 }
 
 // ── 0x0B ZONE_DATA ────────────────────────────────────────────────────────
 //
-// Full zone-data packet including the ZoneData::UnpackFromWeb body.
+// switch dispatch is opcode-1, so case 10 = opcode 0x0B.
+// case 10 reads: GetByte(flag) + GetByte(second_byte), then if flag==1 calls
+// ProcessIncomingZoneData which reads: GetString(zone_name) + UnpackFromWeb + GetByte(type).
+//
+// S→C: [0x0B][u8 flag=1][u8 second_byte=0][Str zone_name]
+//       ZoneData::UnpackFromWeb:
+//         [InventoryItem][u8 rot][i16×4 coords][Str outer_item_zone][i16 timer_count]
+//       [u8 type]
+
+pub struct InteriorInfo<'a> {
+    pub item_bytes: &'a [u8],
+    pub rotation: u8,
+    pub cx: i16,
+    pub cz: i16,
+    pub tx: i16,
+    pub tz: i16,
+    pub outer_zone: &'a str,
+}
 
 pub struct ZoneData<'a> {
     pub zone_name: &'a str,
+    pub interior: Option<InteriorInfo<'a>>,
 }
 impl ServerPacket for ZoneData<'_> {
     fn to_payload(&self) -> Vec<u8> {
         let mut p = vec![0x0Bu8];
         p.push(0x01); // flag = 1 (zone data follows)
-        p.push(0x00); // sub_flag = 0
         p.extend(pack_string(self.zone_name));
-        // ZoneData::UnpackFromWeb: empty InventoryItem (3 zero counts) + zone_type
-        p.extend_from_slice(&[0u8; 6]); // count1=0, count2=0, count3=0
-        p.push(0x00);                   // zone_type = overworld
-        p.extend_from_slice(&[0u8; 8]); // unknown1–4 (4 × i16)
-        p.extend(pack_string(self.zone_name)); // zone_name (inner)
-        p.extend_from_slice(&0i16.to_le_bytes()); // timer_dict_count = 0
-        p.push(0x00); // trailing zone_type
+        // ZoneData::UnpackFromWeb body
+        match &self.interior {
+            Some(s) => {
+                p.extend_from_slice(s.item_bytes);
+                p.push(s.rotation);
+                p.extend_from_slice(&s.cx.to_le_bytes());
+                p.extend_from_slice(&s.cz.to_le_bytes());
+                p.extend_from_slice(&s.tx.to_le_bytes());
+                p.extend_from_slice(&s.tz.to_le_bytes());
+                p.extend(pack_string(s.outer_zone));
+            }
+            None => {
+                // empty InventoryItem (3 × i16 zero counts)
+                p.extend_from_slice(&[0u8; 6]);
+                p.push(0x00); // rotation
+                p.extend_from_slice(&[0u8; 8]); // 4 × i16 coords
+                p.extend(pack_string("")); // outer_item_zone
+            }
+        }
+        p.extend_from_slice(&0i16.to_le_bytes()); // timer_count = 0
+        p.push(0x00); // type
         p
     }
 }
@@ -804,6 +840,8 @@ mod tests {
             client_is_mod:  false,
             max_companions: 3,
             pvp_enabled:    true,
+            uid_start:      0,
+            uid_count:      0,
         }.to_payload();
         let mut off = 0;
         assert_eq!(pkt[off], 0x05); off += 1;

@@ -182,6 +182,31 @@ fn placed_to_element(p: PlacedObject) -> ChunkElement {
     ChunkElement { cell_x: p.cell_x, cell_z: p.cell_z, rotation: p.rotation, item_data: p.item_data }
 }
 
+// ── Zone registry ─────────────────────────────────────────────────────────
+
+/// Item-backed data for zones that live inside a placed object (houses, caves, dimensions, …).
+/// Absent for plain zones (overworld, plugin-defined zones with no physical item).
+pub struct InteriorData {
+    pub item_bytes: Vec<u8>,
+    pub rotation: u8,
+    pub cx: i16,
+    pub cz: i16,
+    pub tx: i16,
+    pub tz: i16,
+    pub outer_zone: String,
+}
+
+/// One entry in the zone registry.
+/// Plain zones (overworld, plugin zones) have `interior: None`.
+/// Item-backed zones (houses, caves, dimensions) carry `interior: Some(…)`.
+pub struct ZoneEntry {
+    pub interior: Option<InteriorData>,
+}
+
+impl ZoneEntry {
+    pub fn plain() -> Self { Self { interior: None } }
+}
+
 // ── World state ───────────────────────────────────────────────────────────
 
 /// Complete state for a single managed world.
@@ -192,6 +217,9 @@ pub struct WorldState {
     pub chunks: RwLock<HashMap<(i16, i16), Chunk>>,
     pub players: RwLock<HashMap<String, TrackedPlayer>>,
     pub baskets: BasketStore,
+    /// All known zones keyed by name. Pre-populated from the template; extended at runtime
+    /// by BUILD (interior items) and plugins (custom zones).
+    pub zones: RwLock<HashMap<String, ZoneEntry>>,
     pub(crate) generator: WorldGenerator,
 }
 
@@ -226,12 +254,18 @@ impl WorldState {
             }
         }
 
+        // Pre-populate zone registry from template zone names.
+        let zone_map: HashMap<String, ZoneEntry> = generator.template_zones()
+            .map(|name| (name.to_string(), ZoneEntry::plain()))
+            .collect();
+
         Self {
             name: name.to_string(),
             default_zone,
             chunks: RwLock::new(chunks),
             players: RwLock::new(HashMap::new()),
             baskets: BasketStore::new(),
+            zones: RwLock::new(zone_map),
             generator,
         }
     }

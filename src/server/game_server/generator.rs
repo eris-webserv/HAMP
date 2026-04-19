@@ -415,6 +415,11 @@ impl WorldGenerator {
         }
     }
 
+    /// Returns an iterator over the zone names defined in the template.
+    pub fn template_zones(&self) -> impl Iterator<Item = &str> {
+        self.template.zones.iter().map(|z| z.name.as_str())
+    }
+
     pub fn template(&self) -> &WorldTemplate {
         &self.template
     }

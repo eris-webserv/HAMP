@@ -67,6 +67,10 @@ pub struct Config {
     /// damage on the client side.  Set to true to enable combat between players.
     pub pvp_enabled: bool,
 
+    /// Print a hex dump of every C→S packet to stdout.  Useful for debugging
+    /// protocol issues.  Can be noisy on busy servers.
+    pub log_packets: bool,
+
     // ── Friend-server registry (game server → friend server) ──────────────
     /// Hostname/IP of the friend server's registry listener.
     /// Leave empty to disable registry registration.
@@ -117,6 +121,7 @@ impl Default for Config {
             world_data_dir:"world_data".to_string(),
             world_seed:     None,
             pvp_enabled:    false,
+            log_packets:    true,
 
             friend_registry_host:   String::new(),
             friend_registry_port:   0,

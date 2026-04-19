@@ -12,6 +12,9 @@
 // Game-server packets live in server::game_server::packets_{client,server}.
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub static LOG_PACKETS: AtomicBool = AtomicBool::new(false);
 
 use binrw::binrw;
 
@@ -209,6 +212,9 @@ fn craft_frame(qid: u8, status: u8, payload: &[u8]) -> Vec<u8> {
 /// client reassembles them before dispatching to its packet handler — no
 /// client-side changes required.
 pub fn write_payload<W: std::io::Write>(w: &mut W, qid: u8, payload: &[u8]) -> std::io::Result<()> {
+    if LOG_PACKETS.load(Ordering::Relaxed) && !payload.is_empty() {
+        println!("[S→C] 0x{:02X} | {}", payload[0], to_hex_upper(payload));
+    }
     if payload.len() <= MAX_FRAME_PAYLOAD {
         return w.write_all(&craft_batch(qid, payload));
     }

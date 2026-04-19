@@ -37,9 +37,81 @@ use std::sync::{Arc, Mutex};
 /// IDs are 64-bit so overflow is not a practical concern.
 static NEXT_UNIQUE_ID: AtomicI64 = AtomicI64::new(1_000_000);
 
+fn pkt_name(pid: u8) -> &'static str {
+    match pid {
+        0x01 => "PING",
+        0x02 => "JOIN",
+        0x03 => "PLAYER_DATA",
+        0x06 => "CHAT",
+        0x09 => "GUARD_DIE_NOTIF",
+        0x0A => "REQ_ZONE",
+        0x0C => "REQ_CHUNK",
+        0x0F => "HEARTBEAT",
+        0x11 => "POSITION",
+        0x14 => "CHANGE_ZONE",
+        0x15 => "START_TELEPORT",
+        0x16 => "END_TELEPORT",
+        0x18 => "CHANGE_EQUIP",
+        0x19 => "UPDATE_CREATURES",
+        0x1A => "REQ_CONTAINER",
+        0x1B => "CONTAINER_RESP",
+        0x1E => "CLOSE_BASKET",
+        0x20 => "BUILD_FURNITURE",
+        0x21 => "REMOVE_OBJECT",
+        0x22 => "REPLACE_BUILDABLE",
+        0x23 => "CHANGE_LAND_USER",
+        0x26 => "LOGIN",
+        0x27 => "CLAIM_OBJECT",
+        0x28 => "RELEASE_INTERACTING",
+        0x29 => "REQ_MORE_IDS",
+        0x2A => "UNIQUE_ID_SEND",
+        0x2B => "USED_UNIQUE_ID",
+        0x2D => "MUSIC_BOX_NOTE",
+        0x2E => "REQ_TELE_PAGE",
+        0x2F => "REQ_TELEPORTERS",
+        0x30 => "TELE_SCREENSHOT",
+        0x31 => "REQ_TELE_SCREENSHOT",
+        0x33 => "EDIT_TELEPORTER",
+        0x34 => "NEW_TELE_SEARCH",
+        0x35 => "MINIGAME_CHALLENGE",
+        0x36 => "MINIGAME_RESPONSE",
+        0x37 => "BEGIN_MINIGAME",
+        0x38 => "EXIT_MINIGAME",
+        0x39 => "POOL_CUE_POS",
+        0x3A => "POOL_SHOOT",
+        0x3B => "POOL_SYNC_READY",
+        0x3C => "POOL_PLACE_BALL",
+        0x3D => "POOL_PLAY_AGAIN",
+        0x3E => "FINISH_SIT",
+        0x3F => "CLAIM_MOBS",
+        0x40 => "DELOAD_MOB",
+        0x41 => "MOB_POSITIONS",
+        0x46 => "ATTACK_ANIM",
+        0x47 => "HIT_MOB",
+        0x48 => "MOB_DIE",
+        0x4A => "CREATURE_STATS",
+        0x4B => "INCREASE_HP",
+        0x4C => "SHOW_EXP",
+        0x4E => "COMPANION_EQUIP",
+        0x4F => "RENAME_COMPANION",
+        0x50 => "DESTROY_COMPANION",
+        0x51 => "APPLY_PERK",
+        0x52 => "LAUNCH_PERK",
+        0x53 => "QUICK_TAG",
+        0x54 => "ALL_PERKS",
+        0x55 => "CREATE_PERK_DROP",
+        0x56 => "RESPAWN",
+        0x57 => "BACK_TO_BREEDER",
+        0x58 => "MOB_TARGET_SYNC",
+        0x59 => "CREATE_MOB",
+        0x5A => "BANDIT_FLAG_DEST",
+        _    => "UNKNOWN",
+    }
+}
+
 use crate::utils::config::Config;
 #[allow(unused_imports)]
-use crate::defs::packet::{craft_batch, pack_string, unpack_string, write_payload, ServerPacket};
+use crate::defs::packet::{craft_batch, pack_string, unpack_string, write_payload, ServerPacket, LOG_PACKETS};
 #[allow(unused_imports)]
 use packets_client::{skip_basket_contents, GameClientPacket};
 #[allow(unused_imports)]
@@ -50,7 +122,7 @@ use packets_server::{
     MinigameChallengeRelay, MinigameResponseRelay, NamedRelayPacket, NoPrefixPacket,
     PlayerGone, PlayerNearby, PlayerPrefixPacket, Pong, PositionUpdate,
     ReleaseInteractingObject, SetInteractingObject,
-    UniqueIds, ZoneChangeBroadcast, ZoneData, ZoneForGuest, ZoneRelayToHost,
+    UniqueIds, ZoneChangeBroadcast, ZoneData, ZoneForGuest, ZoneRelayToHost, InteriorInfo,
 };
 use world_state::WorldState;
 use generator::WorldTemplate;
@@ -89,6 +161,8 @@ pub(crate) struct Session {
     /// Whether player-vs-player combat is enabled. Sent to clients as packet
     /// 0x05 during login so `CombatControl$HitAllowed` allows player damage.
     pvp_enabled: bool,
+    /// Print hex dumps of every C→S packet to stdout when true.
+    log_packets: bool,
     /// The address the listener is bound to — used to unblock the accept loop on shutdown.
     listen_addr: Mutex<Option<std::net::SocketAddr>>,
     /// The host player's username (relay mode only). The host client owns
@@ -103,11 +177,12 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    fn new(room_token: impl Into<String>, mode: SessionMode, pvp_enabled: bool) -> Arc<Self> {
+    fn new(room_token: impl Into<String>, mode: SessionMode, pvp_enabled: bool, log_packets: bool) -> Arc<Self> {
         Arc::new(Self {
             room_token: room_token.into(),
             mode,
             pvp_enabled,
+            log_packets,
             players: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             listen_addr: Mutex::new(None),
@@ -194,6 +269,40 @@ fn read_inventory_item(data: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     Some((data[start..off].to_vec(), off))
 }
 
+/// Extracts `(shack_id, item_id)` from wire-format InventoryItem bytes.
+///
+/// Looks for int key `"shack_id = *long* "` and string key `"item_id"`.
+/// Returns None if either key is absent (not a shack item).
+fn parse_shack_info(data: &[u8]) -> Option<(i32, String)> {
+    let mut off = 0usize;
+    macro_rules! need { ($n:expr) => { if off + $n > data.len() { return None; } } }
+    macro_rules! read_u16 { () => {{ need!(2); let v = u16::from_le_bytes([data[off], data[off+1]]); off += 2; v as usize }} }
+    macro_rules! read_str { () => {{ let l = read_u16!(); need!(l); let s = String::from_utf8_lossy(&data[off..off+l]).into_owned(); off += l; s }} }
+
+    let n_shorts = read_u16!();
+    for _ in 0..n_shorts {
+        let _ = read_str!();
+        need!(2); off += 2;
+    }
+    let n_strings = read_u16!();
+    let mut item_id: Option<String> = None;
+    for _ in 0..n_strings {
+        let key = read_str!();
+        let val = read_str!();
+        if key == "item_id" { item_id = Some(val); }
+    }
+    let n_ints = read_u16!();
+    let mut shack_id: Option<i32> = None;
+    for _ in 0..n_ints {
+        let key = read_str!();
+        need!(4);
+        let val = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+        off += 4;
+        if key == "shack_id = *long* " { shack_id = Some(val); }
+    }
+    Some((shack_id?, item_id?))
+}
+
 /// Rewrite the `currently_using` string inside a stored OPD blob.
 ///
 /// OPD layout: pos(8) + pos(8) + rot(8) + is_dead(1) = 25-byte fixed header,
@@ -250,6 +359,13 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             if data.len() < 10 { continue; }
             let pid = data[9];
             let data = data.as_slice();
+
+            if session.log_packets {
+                use crate::defs::packet::to_hex_upper;
+                let uid = player_id.as_deref().unwrap_or("?");
+                println!("[C→S] [GAME:'{}'] {}({}) | 0x{:02X} ({}) | {}",
+                    session.room_token, uid, addr, pid, pkt_name(pid), to_hex_upper(data));
+            }
 
         match pid {
 
@@ -348,24 +464,21 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 // 1. S→C 0x26: login response
                 let _ = write_payload(&mut stream, 2, &LoginResponse { world_name: &world, player_uid: &uid }.to_payload());
 
-                // 2. S→C 0x2A: unique IDs — allocate a per-player block from the global counter.
-                const INITIAL_ID_BLOCK: u16 = 25;
-                let id_start = NEXT_UNIQUE_ID.fetch_add(INITIAL_ID_BLOCK as i64, Ordering::Relaxed);
-                let _ = write_payload(&mut stream, 2, &UniqueIds { start: id_start, count: INITIAL_ID_BLOCK }.to_payload());
-
-                // 3. S→C 0x02: join confirmed (is_host=true for host, false for guests)
+                // 2. S→C 0x02: join confirmed (is_host=true for host, false for guests)
                 let _ = write_payload(&mut stream, 2, &JoinConfirmed { server_name: &world, username: &uid, is_host: is_host_flag }.to_payload());
 
-                // 3b. S→C 0x05: session init — compound packet containing daynight,
-                //     companion limit, saved-position skip flag, and PVP state.
-                //     Sending uid_count=0 and perk_count=0 skips those loops.
-                //     skip_saved_pos=1 prevents the client from overriding our
-                //     zone spawn with a server-saved position.
+                // 3. S→C 0x05: session init — delivers unique IDs and session state.
+                //    unique IDs go here (uid_count field), not as standalone 0x2A.
+                //    skip_saved_pos=1 prevents the client from overriding our spawn.
+                const INITIAL_ID_BLOCK: u16 = 64;
+                let id_start = NEXT_UNIQUE_ID.fetch_add(INITIAL_ID_BLOCK as i64, Ordering::Relaxed);
                 let _ = write_payload(&mut stream, 2, &SessionInit {
                     daynight_ms:    12000,
                     client_is_mod:  false,
                     max_companions: 3,
                     pvp_enabled:    session.pvp_enabled,
+                    uid_start:      id_start,
+                    uid_count:      INITIAL_ID_BLOCK,
                 }.to_payload());
 
                 // 4. S→C 0x0B: zone data
@@ -373,7 +486,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     SessionMode::Managed(ref ws) => ws.default_zone.clone(),
                     SessionMode::Relay => "overworld".to_string(),
                 };
-                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone_name }.to_payload());
+                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone_name, interior: None }.to_payload());
 
                 // 6. S→C 0x07: join notification (broadcast to others)
                 session.broadcast(&JoinNotif { username: &uid, joined: true }, Some(uid.as_str()));
@@ -420,7 +533,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             };
                             if effective != ws.default_zone {
                                 let _ = write_payload(&mut stream, 2,
-                                    &ZoneData { zone_name: &effective }.to_payload());
+                                    &ZoneData { zone_name: &effective, interior: None }.to_payload());
                             }
                             effective
                         } else {
@@ -534,12 +647,19 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
                     match session.mode {
                         SessionMode::Managed(ref ws) => {
-                            let zone = if zone_name.is_empty() {
-                                ws.default_zone.clone()
-                            } else {
-                                zone_name
-                            };
-                            let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone }.to_payload());
+                            let zone = if zone_name.is_empty() { ws.default_zone.clone() } else { zone_name };
+                            let zones = ws.zones.read().unwrap();
+                            let interior = zones.get(&zone)
+                                .and_then(|e| e.interior.as_ref())
+                                .map(|id| InteriorInfo {
+                                    item_bytes: &id.item_bytes,
+                                    rotation: id.rotation,
+                                    cx: id.cx, cz: id.cz,
+                                    tx: id.tx, tz: id.tz,
+                                    outer_zone: &id.outer_zone,
+                                });
+                            let payload = ZoneData { zone_name: &zone, interior }.to_payload();
+                            let _ = write_payload(&mut stream, 2, &payload);
                         }
                         SessionMode::Relay => {
                             let host = session.host.lock().unwrap().clone();
@@ -547,7 +667,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             if is_host {
                                 // Host gets zone data directly.
                                 let zone = if zone_name.is_empty() { "overworld".to_string() } else { zone_name };
-                                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone }.to_payload());
+                                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone, interior: None }.to_payload());
                             } else if let Some(ref hname) = host {
                                 // Guest → relay to host.
                                 // Host expects: Str(zone_name) + Str(requester) + u8(type) [+ Pos if type 2|3]
@@ -776,14 +896,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 session.pending_containers.lock().unwrap()
                                     .entry(bk).or_default().push(uid.clone());
 
-                                let mut relay = vec![0x1Bu8];
+                                let mut relay = vec![0x1Cu8];
                                 relay.extend(pack_string(uid));
                                 relay.extend_from_slice(&(basket_id as u32).to_le_bytes());
                                 session.send_to(hname, &relay);
                             }
                         } else if let SessionMode::Managed(ref world) = session.mode {
                             let contents = world.baskets.get_contents(basket_id);
-                            let mut out = vec![0x1Au8];
+                            let mut out = vec![0x1Bu8];
                             out.extend_from_slice(&(basket_id as u32).to_le_bytes());
                             out.extend_from_slice(&contents);
                             session.send_to(uid, &out);
@@ -794,7 +914,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
             // ── HOST CONTAINER RESPONSE (0x1B) — relay mode only ─────────
             // Host sends: 0x1B + String(requester) + u32(basket_id) + BasketContents
-            // Guest expects: 0x1A + u32(basket_id) + BasketContents  (same ID as the request)
+            // Guest expects: 0x1B + u32(basket_id) + BasketContents  (same ID as the request)
             0x1B if matches!(session.mode, SessionMode::Relay) => {
                 if let Some(ref uid) = player_id {
                     let is_host = session.host.lock().unwrap()
@@ -806,7 +926,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                 data[off], data[off+1], data[off+2], data[off+3],
                             ]) as i64;
 
-                            let mut out = vec![0x1Au8];
+                            let mut out = vec![0x1Bu8];
                             out.extend_from_slice(&data[off..]); // u32(basket_id) + contents
 
                             let bk = basket_id.to_string();
@@ -1056,7 +1176,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 // managed mode: drop — we allocated IDs ourselves
             }
 
-            // ── ASK_JOIN (0x2D) — relay to named target ───────────────────
+            // ── MUSIC_BOX_NOTE (0x2D) — relay to named target ────────────
+            // C→S: [str target_player][note data...] (point-to-point)
             0x2D => {
                 if let Some(ref uid) = player_id {
                     let (target, off) = unpack_string(data, 10);
@@ -1067,14 +1188,23 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── YOU_MAY_JOIN (0x2B) — relay to named target ───────────────
+            // ── USED_UNIQUE_ID (0x2B) ────────────────────────────────────
+            // C→S from GameServerSender$$SendUsedUniqueId:
+            //   [0x2B][u32(used_id)]  (Packet.GetLong = 4 bytes)
+            //
+            // Broadcast to peers so they drop the ID from their per-player
+            // unique_ids_given_away dict.  S→C wire (case 0x2B in receiver):
+            //   [0x2B][Str(player)][u32(id)]
+            //
+            // NOTE: 0x2B is YOU_MAY_JOIN on the *friend* server — unrelated.
             0x2B => {
                 if let Some(ref uid) = player_id {
-                    let (target, off) = unpack_string(data, 10);
-                    let mut pkt = vec![0x2Bu8];
-                    pkt.extend(pack_string(uid));
-                    pkt.extend_from_slice(&data[off..]);
-                    session.send_to(&target, &pkt);
+                    if data.len() >= 10 + 4 {
+                        let mut pkt = vec![0x2Bu8];
+                        pkt.extend(pack_string(uid));
+                        pkt.extend_from_slice(&data[10..10 + 4]);
+                        session.broadcast(&pkt, Some(uid.as_str()));
+                    }
                 }
             }
 
@@ -1126,8 +1256,21 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                     });
                                     chunk.elements.push(ChunkElement {
                                         cell_x: tx as u8, cell_z: tz as u8,
-                                        rotation, item_data: item_bytes,
+                                        rotation, item_data: item_bytes.clone(),
                                     });
+                                    drop(chunks);
+                                    // Register zone for any item that carries a shack_id.
+                                    if let Some((shack_id, _)) = parse_shack_info(&item_bytes) {
+                                        let zone_name = format!("shack9072{}", shack_id);
+                                        ws.zones.write().unwrap().insert(zone_name, world_state::ZoneEntry {
+                                            interior: Some(world_state::InteriorData {
+                                                item_bytes,
+                                                rotation,
+                                                cx, cz, tx, tz,
+                                                outer_zone: zone_str.clone(),
+                                            }),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1652,14 +1795,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── REQ_UNIQUE_IDS (0x29) — allocate another block of IDs ────
-            // Client sends this when its pool is running low.
-            // Respond with S→C 0x2A carrying a fresh range from the global counter.
+            // Client sends this (no payload) when its pool is running low.
+            // Respond immediately with S→C 0x2A so the pool refills before it
+            // drops below 2 (which triggers the "Unique IDs Exhausted" disconnect).
+            // Sent unconditionally — some clients fire this before 0x26 completes.
             0x29 => {
-                if player_id.is_some() {
-                    const REFILL_BLOCK: u16 = 25;
-                    let id_start = NEXT_UNIQUE_ID.fetch_add(REFILL_BLOCK as i64, Ordering::Relaxed);
-                    let _ = write_payload(&mut stream, 2, &UniqueIds { start: id_start, count: REFILL_BLOCK }.to_payload());
-                }
+                const REFILL_BLOCK: u16 = 64;
+                let id_start = NEXT_UNIQUE_ID.fetch_add(REFILL_BLOCK as i64, Ordering::Relaxed);
+                let _ = write_payload(&mut stream, 2, &UniqueIds { start: id_start, count: REFILL_BLOCK }.to_payload());
             }
 
             // ── Host-originated S→C packets — relay as-is ─────────────
@@ -1686,6 +1829,11 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // ── Unknown — relay with player prefix ────────────────────────
             _ => {
                 if let Some(ref uid) = player_id {
+                    if session.log_packets {
+                        use crate::defs::packet::to_hex_upper;
+                        println!("[GAME:'{}'] [RELAY/UNKNOWN] 0x{:02X} from {} — relaying to zone | {}",
+                            session.room_token, pid, uid, to_hex_upper(data));
+                    }
                     let mut pkt = vec![pid];
                     pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
@@ -1836,7 +1984,8 @@ pub fn run(cfg: &Config) {
         });
     }
 
-    let session = Session::new(&cfg.server_name, SessionMode::Managed(Arc::clone(&world)), cfg.pvp_enabled);
+    LOG_PACKETS.store(cfg.log_packets, std::sync::atomic::Ordering::Relaxed);
+    let session = Session::new(&cfg.server_name, SessionMode::Managed(Arc::clone(&world)), cfg.pvp_enabled, cfg.log_packets);
 
     // Optionally register with a friend server.
     if !cfg.friend_registry_host.is_empty()
@@ -1901,7 +2050,7 @@ pub fn spawn_relay_session(room_token: String, cfg: &Config) -> Option<u16> {
     for port in cfg.game_port..=cfg.game_port_max {
         let addr = format!("{}:{}", cfg.host, port);
         if let Ok(listener) = TcpListener::bind(&addr) {
-            let session = Session::new(room_token.clone(), SessionMode::Relay, false);
+            let session = Session::new(room_token.clone(), SessionMode::Relay, false, true);
             *session.listen_addr.lock().unwrap() = listener.local_addr().ok();
             let accept_session = Arc::clone(&session);
             println!("[GAME] Relay session '{}' → port {}", room_token, port);
