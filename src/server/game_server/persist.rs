@@ -8,10 +8,13 @@
 //
 //  ─── Template ──────────────────────────────────────────────────────────────
 //  [8]  seed: u64 le
+//  [2]  start_biome: i16 le               (v2+)
+//  [2]  start_biome_radius: i16 le        (v2+)
 //  [2]  zone_count: u16 le
 //  per zone:
 //    [str] name: u16_len + utf-8 bytes
-//    [8]   biome weights: u8 × 8
+//    v1:   [8]   biome weights: u8 × 8
+//    v2+:  [32]  biome weights: f32 le × 8
 //             (grass, snow, desert, evergreen, ocean, swamp, woodlands, sakura)
 //
 //  ─── Chunks ────────────────────────────────────────────────────────────────
@@ -48,7 +51,7 @@ use super::generator::{BiomeWeights, WorldGenerator, WorldTemplate, ZoneConfig};
 use super::world_state::{Chunk, ChunkElement, WorldState, ZoneEntry};
 
 const MAGIC: &[u8; 4] = b"HAMP";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 pub const FILE_NAME: &str = "world.hws";
 
 // ── Low-level write helpers ───────────────────────────────────────────────
@@ -114,14 +117,16 @@ fn write_state<W: Write>(state: &WorldState, w: &mut W) -> io::Result<()> {
     // Template
     let tmpl = state.generator.template();
     wu64(w, tmpl.seed)?;
+    wi16(w, tmpl.start_biome)?;
+    wi16(w, tmpl.start_biome_radius)?;
     wu16(w, tmpl.zones.len() as u16)?;
     for zone in &tmpl.zones {
         wstr(w, &zone.name)?;
         let wt = &zone.weights;
-        w.write_all(&[
-            wt.grass, wt.snow, wt.desert, wt.evergreen,
-            wt.ocean, wt.swamp, wt.woodlands, wt.sakura,
-        ])?;
+        for v in [wt.grass, wt.snow, wt.desert, wt.evergreen,
+                  wt.ocean, wt.swamp, wt.woodlands, wt.sakura] {
+            w.write_all(&v.to_le_bytes())?;
+        }
     }
 
     // Chunks
@@ -168,7 +173,7 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a HAMP world file"));
     }
     let version = ru8(&mut r)?;
-    if version != VERSION {
+    if version != 1 && version != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported world file version {version}"),
@@ -177,18 +182,38 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
 
     // Template
     let seed = ru64(&mut r)?;
+    let (start_biome, start_biome_radius) = if version >= 2 {
+        (ri16(&mut r)?, ri16(&mut r)?)
+    } else {
+        (0, 0) // v1 had no start-area override
+    };
     let zone_count = ru16(&mut r)? as usize;
     let mut zones = Vec::with_capacity(zone_count);
     for _ in 0..zone_count {
         let name = rstr(&mut r)?;
-        let mut wb = [0u8; 8];
-        r.read_exact(&mut wb)?;
-        zones.push(ZoneConfig::new(name, BiomeWeights {
-            grass:     wb[0], snow:      wb[1], desert:    wb[2], evergreen: wb[3],
-            ocean:     wb[4], swamp:     wb[5], woodlands: wb[6], sakura:    wb[7],
-        }));
+        let weights = if version >= 2 {
+            let mut buf = [0u8; 32];
+            r.read_exact(&mut buf)?;
+            let rf = |i: usize| f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap());
+            BiomeWeights {
+                grass:     rf(0), snow:      rf(1), desert:    rf(2), evergreen: rf(3),
+                ocean:     rf(4), swamp:     rf(5), woodlands: rf(6), sakura:    rf(7),
+            }
+        } else {
+            let mut wb = [0u8; 8];
+            r.read_exact(&mut wb)?;
+            BiomeWeights {
+                grass:     wb[0] as f32, snow:      wb[1] as f32,
+                desert:    wb[2] as f32, evergreen: wb[3] as f32,
+                ocean:     wb[4] as f32, swamp:     wb[5] as f32,
+                woodlands: wb[6] as f32, sakura:    wb[7] as f32,
+            }
+        };
+        zones.push(ZoneConfig::new(name, weights));
     }
-    let template = WorldTemplate::new(seed, zones);
+    let mut template = WorldTemplate::new(seed, zones);
+    template.start_biome        = start_biome;
+    template.start_biome_radius = start_biome_radius;
     let default_zone = template.zones.first()
         .map(|z| z.name.clone())
         .unwrap_or_else(|| "overworld".to_string());

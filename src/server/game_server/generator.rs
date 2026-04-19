@@ -258,56 +258,93 @@ pub const BLOB_MAP: [[u8; 36]; 36] = [
 
 // ── BiomeWeights ──────────────────────────────────────────────────────────
 //
-// Controls how many of the 36 blobs get each biome type.
-// Total must equal 36 for a fully-covered sector; excess blobs beyond the
-// pool wrap back to grass.
+// Relative biome commonness. Values are ratios (e.g. 1.00, 0.50) and are
+// normalized against their sum to fill the 36-blob pool that covers a
+// sector. Zero-weighted biomes never appear.
 //
-// Default matches game call: GenerateNewBiomeMap(..., 2, 1, 1, 1, 2, 1, 1, 1)
-//   grass=2, snow=1, desert=1, evergreen=1, ocean=2, swamp=1, woodlands=1, sakura=1
+// RE: `GameController$ParseBiomeCommonness` in HybridsPublicServer
+// uses the same notion of per-biome ratios read from `config_vals`.
+// The original scaled percentages 0-100 to the client; our generator
+// consumes them directly as ratios.
+//
+// Defaults mirror the original's 8-biome call pattern
+//   (2, 1, 1, 1, 2, 1, 1, 1) expressed as fractions of the grass weight.
 
 #[derive(Clone, Debug)]
 pub struct BiomeWeights {
-    pub grass:     u8,
-    pub snow:      u8,
-    pub desert:    u8,
-    pub evergreen: u8,
-    pub ocean:     u8,
-    pub swamp:     u8,
-    pub woodlands: u8,
-    pub sakura:    u8,
+    pub grass:     f32,
+    pub snow:      f32,
+    pub desert:    f32,
+    pub evergreen: f32,
+    pub ocean:     f32,
+    pub swamp:     f32,
+    pub woodlands: f32,
+    pub sakura:    f32,
 }
 
 impl Default for BiomeWeights {
     fn default() -> Self {
         Self {
-            grass:     2,
-            snow:      1,
-            desert:    1,
-            evergreen: 1,
-            ocean:     2,
-            swamp:     1,
-            woodlands: 1,
-            sakura:    1,
+            grass:     1.00,
+            snow:      0.50,
+            desert:    0.50,
+            evergreen: 0.50,
+            ocean:     1.00,
+            swamp:     0.50,
+            woodlands: 0.50,
+            sakura:    0.50,
         }
     }
 }
 
 impl BiomeWeights {
-    /// Expands the weights into an ordered biome-assignment pool.
-    /// The pool is shuffled per-sector using the seeded RNG.
+    /// Expands the weights into an ordered 36-entry biome pool.
+    ///
+    /// Uses largest-remainder rounding so the counts sum to exactly 36
+    /// regardless of the input weights. If every weight is <= 0 the pool
+    /// falls back to all-grass.
     fn to_pool(&self) -> Vec<u8> {
-        let mut pool = Vec::with_capacity(36);
-        for _ in 0..self.grass     { pool.push(BIOME_GRASS);     }
-        for _ in 0..self.snow      { pool.push(BIOME_SNOW);      }
-        for _ in 0..self.desert    { pool.push(BIOME_DESERT);    }
-        for _ in 0..self.evergreen { pool.push(BIOME_EVERGREEN); }
-        for _ in 0..self.ocean     { pool.push(BIOME_OCEAN);     }
-        for _ in 0..self.swamp     { pool.push(BIOME_SWAMP);     }
-        for _ in 0..self.woodlands { pool.push(BIOME_WOODLANDS); }
-        for _ in 0..self.sakura    { pool.push(BIOME_SAKURA);    }
-        // Pad to 36 with grass if weights sum to less than 36
-        while pool.len() < 36 { pool.push(BIOME_GRASS); }
-        pool.truncate(36);
+        const TOTAL: usize = 36;
+        let entries: [(u8, f32); 8] = [
+            (BIOME_GRASS,     self.grass.max(0.0)),
+            (BIOME_SNOW,      self.snow.max(0.0)),
+            (BIOME_DESERT,    self.desert.max(0.0)),
+            (BIOME_EVERGREEN, self.evergreen.max(0.0)),
+            (BIOME_OCEAN,     self.ocean.max(0.0)),
+            (BIOME_SWAMP,     self.swamp.max(0.0)),
+            (BIOME_WOODLANDS, self.woodlands.max(0.0)),
+            (BIOME_SAKURA,    self.sakura.max(0.0)),
+        ];
+        let sum: f32 = entries.iter().map(|e| e.1).sum();
+        if sum <= 0.0 {
+            return vec![BIOME_GRASS; TOTAL];
+        }
+
+        // Floor counts + remainders for largest-remainder apportionment.
+        let mut counts = [0usize; 8];
+        let mut rems   = [(0usize, 0.0_f32); 8];
+        let mut assigned = 0usize;
+        for (i, (_, w)) in entries.iter().enumerate() {
+            let raw = *w / sum * TOTAL as f32;
+            let floor = raw.floor() as usize;
+            counts[i] = floor;
+            rems[i]   = (i, raw - raw.floor());
+            assigned += floor;
+        }
+        // Distribute remaining slots to the biggest remainders.
+        rems.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut k = 0;
+        while assigned < TOTAL {
+            counts[rems[k % 8].0] += 1;
+            assigned += 1;
+            k += 1;
+        }
+
+        let mut pool = Vec::with_capacity(TOTAL);
+        for (i, (biome, _)) in entries.iter().enumerate() {
+            for _ in 0..counts[i] { pool.push(*biome); }
+        }
+        pool.truncate(TOTAL);
         pool
     }
 }
@@ -334,10 +371,17 @@ impl ZoneConfig {
 // ── WorldTemplate ─────────────────────────────────────────────────────────
 
 /// Top-level world generation configuration.
+///
+/// `start_biome` forces every chunk within `start_biome_radius` of (0,0)
+/// to spawn as that biome — mirrors the `"Biome at start area"` option in
+/// the original public server. A negative biome or zero radius disables
+/// the override.
 #[derive(Clone, Debug)]
 pub struct WorldTemplate {
     pub seed:  u64,
     pub zones: Vec<ZoneConfig>,
+    pub start_biome:        i16,
+    pub start_biome_radius: i16,
 }
 
 impl Default for WorldTemplate {
@@ -345,13 +389,15 @@ impl Default for WorldTemplate {
         Self {
             seed:  0,
             zones: vec![ZoneConfig::default_main()],
+            start_biome:        BIOME_GRASS as i16,
+            start_biome_radius: 3,
         }
     }
 }
 
 impl WorldTemplate {
     pub fn new(seed: u64, zones: Vec<ZoneConfig>) -> Self {
-        Self { seed, zones }
+        Self { seed, zones, start_biome: BIOME_GRASS as i16, start_biome_radius: 3 }
     }
 
     fn zone_weights(&self, zone_name: &str) -> &BiomeWeights {
@@ -506,7 +552,20 @@ impl WorldGenerator {
 
         let blob_biomes = self.sector_biomes(zone_name, sx, sz);
         let blob_id     = BLOB_MAP[lz][lx] as usize;
-        let biome       = blob_biomes[blob_id] as i16;
+        let mut biome   = blob_biomes[blob_id] as i16;
+
+        // Start-area override: force spawn region to a fixed biome, matching
+        // the `"Biome at start area"` knob on the public server. Applies when
+        // the chunk is within `start_biome_radius` of (0,0) in both axes.
+        let radius = self.template.start_biome_radius;
+        if radius > 0
+            && chunk_x.abs() <= radius as i32
+            && chunk_z.abs() <= radius as i32
+            && self.template.start_biome >= 0
+            && (self.template.start_biome as usize) < BIOME_TEXTURE_COUNTS.len()
+        {
+            biome = self.template.start_biome;
+        }
 
         // Per-chunk floor properties: seeded by world seed ^ chunk coords
         let chunk_salt = (chunk_x as u64)

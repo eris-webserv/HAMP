@@ -125,7 +125,30 @@ use packets_server::{
     UniqueIds, ZoneChangeBroadcast, ZoneData, ZoneForGuest, ZoneRelayToHost, InteriorInfo,
 };
 use world_state::WorldState;
-use generator::WorldTemplate;
+use generator::{
+    BiomeWeights, WorldTemplate, ZoneConfig,
+    BIOME_GRASS, BIOME_SNOW, BIOME_DESERT, BIOME_EVERGREEN,
+    BIOME_OCEAN, BIOME_SWAMP, BIOME_WOODLANDS, BIOME_SAKURA,
+};
+
+/// Resolves a config `start_biome` string to a biome ID.
+/// Returns `None` (no override) for an empty / unknown name.
+fn parse_start_biome(name: &str) -> Option<i16> {
+    match name.trim() {
+        "" => None,
+        s => match s.to_ascii_lowercase().as_str() {
+            "grassland" | "grass"            => Some(BIOME_GRASS as i16),
+            "snow"                           => Some(BIOME_SNOW as i16),
+            "desert"                         => Some(BIOME_DESERT as i16),
+            "evergreen"                      => Some(BIOME_EVERGREEN as i16),
+            "ocean"                          => Some(BIOME_OCEAN as i16),
+            "swamp"                          => Some(BIOME_SWAMP as i16),
+            "woodlands"                      => Some(BIOME_WOODLANDS as i16),
+            "sakura"                         => Some(BIOME_SAKURA as i16),
+            _ => None,
+        },
+    }
+}
 
 // ── Per-session player ─────────────────────────────────────────────────────
 
@@ -1914,8 +1937,22 @@ pub fn run(cfg: &Config) {
                 _ => rand::random::<u64>(),
             };
             println!("[GAME] World seed: {}", seed);
-            let mut tmpl = WorldTemplate::default();
-            tmpl.seed = seed;
+            let weights = BiomeWeights {
+                grass:     cfg.biome_grass_commonness,
+                snow:      cfg.biome_snow_commonness,
+                desert:    cfg.biome_desert_commonness,
+                evergreen: cfg.biome_evergreen_commonness,
+                ocean:     cfg.biome_ocean_commonness,
+                swamp:     cfg.biome_swamp_commonness,
+                woodlands: cfg.biome_woodlands_commonness,
+                sakura:    cfg.biome_sakura_commonness,
+            };
+            let mut tmpl = WorldTemplate::new(
+                seed,
+                vec![ZoneConfig::new("overworld", weights)],
+            );
+            tmpl.start_biome        = parse_start_biome(&cfg.start_biome).unwrap_or(-1);
+            tmpl.start_biome_radius = cfg.start_biome_radius.max(0);
             WorldState::new("World", 5, tmpl)
         }
     };

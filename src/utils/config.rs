@@ -62,6 +62,34 @@ pub struct Config {
     /// restarts.  Has no effect once a save file already exists.
     pub world_seed: Option<u64>,
 
+    // ── World generation — biome commonness ────────────────────────────────
+    //
+    // Relative weights for each biome. Values are ratios (e.g. 1.00, 0.50);
+    // the generator normalizes the set across the 36 blobs that cover one
+    // sector. A weight of 0 disables that biome entirely.
+    //
+    // Mirrors the `Biome '<Name>' commonness` options in the original
+    // HybridsPublicServer config. Woodlands and Sakura did not exist in
+    // the public server and are exposed here for parity with the
+    // reimplementation's extra biomes.
+    pub biome_grass_commonness:     f32,
+    pub biome_snow_commonness:      f32,
+    pub biome_desert_commonness:    f32,
+    pub biome_evergreen_commonness: f32,
+    pub biome_ocean_commonness:     f32,
+    pub biome_swamp_commonness:     f32,
+    pub biome_woodlands_commonness: f32,
+    pub biome_sakura_commonness:    f32,
+
+    /// Biome name forced within `start_biome_radius` of (0, 0).
+    /// Valid values: "Grassland", "Snow", "Desert", "Evergreen", "Ocean",
+    /// "Swamp", "Woodlands", "Sakura". Empty string disables the override.
+    pub start_biome: String,
+
+    /// Half-extent (in chunks) of the forced start-area biome box around
+    /// the world origin. 0 disables.
+    pub start_biome_radius: i16,
+
     /// Whether PVP (player-vs-player damage) is enabled on this game server.
     /// When false (default), `CombatControl$HitAllowed` blocks all player
     /// damage on the client side.  Set to true to enable combat between players.
@@ -120,6 +148,18 @@ impl Default for Config {
             icons_dir:     "icons".to_string(),
             world_data_dir:"world_data".to_string(),
             world_seed:     None,
+
+            biome_grass_commonness:     1.00,
+            biome_snow_commonness:      0.50,
+            biome_desert_commonness:    0.50,
+            biome_evergreen_commonness: 0.50,
+            biome_ocean_commonness:     1.00,
+            biome_swamp_commonness:     0.50,
+            biome_woodlands_commonness: 0.50,
+            biome_sakura_commonness:    0.50,
+            start_biome:               "Grassland".to_string(),
+            start_biome_radius:         3,
+
             pvp_enabled:    false,
             log_packets:    true,
 
@@ -222,6 +262,27 @@ world_data_dir = "world_data"
 # Optional fixed seed for world generation (u64).  Omit or set to 0 for a
 # random seed chosen at first startup.  Ignored if a save file already exists.
 # world_seed = 12345678
+
+# ── World generation — biome commonness ────────────────────────────────────
+# Relative weights for each biome. Values are ratios (e.g. 1.00, 0.50); the
+# generator normalizes them across the 36-blob pool that covers each sector.
+# A weight of 0 disables that biome.  Only read on first world generation —
+# after a save file exists these values come from world.hws.
+biome_grass_commonness     = 1.00
+biome_snow_commonness      = 0.50
+biome_desert_commonness    = 0.50
+biome_evergreen_commonness = 0.50
+biome_ocean_commonness     = 1.00
+biome_swamp_commonness     = 0.50
+# Extra biomes specific to this reimplementation (not in the original server).
+biome_woodlands_commonness = 0.50
+biome_sakura_commonness    = 0.50
+
+# Forced biome in the start area (|chunk_x| <= radius && |chunk_z| <= radius).
+# Valid: "Grassland", "Snow", "Desert", "Evergreen", "Ocean", "Swamp",
+#        "Woodlands", "Sakura".  Empty string disables.
+start_biome        = "Grassland"
+start_biome_radius = 3
 
 # Enable player-vs-player combat (default: false).
 # pvp_enabled = false
