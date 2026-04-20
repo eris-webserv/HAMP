@@ -147,7 +147,7 @@ static OBJECTS_DESERT: &[(&str, u32, u8)] = &[
 
 static OBJECTS_EVERGREEN: &[(&str, u32, u8)] = &[
     // Common
-    ("Evergreen Tree",        20, 2), ("Tar Pit",               20, 2),
+    ("Evergreen Tree",        20, 2), ("Tar Pit",                4, 2),
     ("Dug-up Brown Mushroom", 20, 1), ("Salmonberry Bush",      20, 1),
     ("Stone Vein",            12, 2), ("Spawner - Sticks",      20, 1),
     ("Green Blob",            20, 1),
@@ -177,12 +177,12 @@ static OBJECTS_SAKURA: &[(&str, u32, u8)] = &[
     ("Spirit Tree",            1, 3),
 ];
 
-// Ocean: shell spawners are super-rare; Stone Vein is rare.
-// Chunk object count is capped at 1–3 (see generate_chunk_elements).
+// Ocean: shells are extremely rare — hard to find even 3 in a whole ocean.
+// Stone Vein dominates so shell rolls almost always lose.
 static OBJECTS_OCEAN: &[(&str, u32, u8)] = &[
-    // Rare
-    ("Stone Vein (Ocean)",     5, 2),
-    // Super rare
+    // Common (relative to the rest of the table)
+    ("Stone Vein (Ocean)",    80, 2),
+    // Super rare — each shell ~0.18% per roll
     ("Spawner - Blue Shells",  1, 1), ("Spawner - White Shells", 1, 1),
     ("Spawner - Green Shells", 1, 1), ("Spawner - Purple Shells",1, 1),
     ("Spawner - Black Shells", 1, 1), ("Spawner - Red Shells",   1, 1),
@@ -194,14 +194,18 @@ static OBJECTS_OCEAN_SHALLOW: &[(&str, u32, u8)] = &[
     ("Palm Tree",              1, 2),
 ];
 
-// Swamp (regular): not explicitly specified, keep original character.
+// Swamp: more spaced out than other biomes; cluster logic uses small
+// cluster counts (1–2) and rarely places a large-vein variant.
 static OBJECTS_SWAMP: &[(&str, u32, u8)] = &[
-    ("Willow Tree",            6, 2), ("Mossy Tree",             5, 2),
-    ("Rotting Stump",          4, 1), ("Stone Vein",             3, 2),
-    ("Spawner - Sticks",       4, 1), ("Spawner - Bones",        3, 1),
-    ("Giant Purple Mushroom",  3, 1), ("Giant Brown Mushroom",   2, 1),
-    ("Lavender Bush",          2, 1), ("Spiderhive",             2, 1),
-    ("Creature Nest",          1, 1), ("Lava",                   1, 1),
+    // Common
+    ("Willow Tree",           20, 2), ("Green Blob",            20, 1),
+    ("Dug-up Brown Mushroom", 20, 1), ("Stone Vein",            20, 2),
+    ("Rotting Stump",         20, 1),
+    // Rare
+    ("Giant Purple Mushroom",  5, 1), ("Red Blob",               5, 1),
+    ("Metal Vein",             5, 2), ("Large Metal Vein",       5, 2),
+    // Really rare
+    ("Blue Blob",              2, 1),
 ];
 
 // SwampDark = swamp lake: only a very rare Stone Vein (70% chance of nothing).
@@ -209,16 +213,22 @@ static OBJECTS_SWAMP_DARK: &[(&str, u32, u8)] = &[
     ("Stone Vein",             1, 2),
 ];
 
+// Woodlands: wheat/mushroom clusters are the signature; pumpkins and giant
+// pumpkins are lone finds. Veins cluster, with the large variant being the
+// rarer seed of a cluster.
 static OBJECTS_WOODLANDS: &[(&str, u32, u8)] = &[
-    ("Birch Tree (Variant 1)", 7, 2), ("Birch Tree (Variant 2)", 5, 2),
-    ("Mossy Tree",             5, 2), ("Large Mossy Tree",       2, 2),
-    ("Evergreen Tree",         3, 2), ("Stone Vein",             3, 2),
-    ("Metal Vein",             2, 1), ("Emerald Vein",           1, 1),
-    ("Spawner - Sticks",       5, 1), ("Spawner - Nuts",         4, 1),
-    ("Berry Bush",             3, 1), ("Goldberry Bush",         1, 1),
-    ("Flowers",                3, 1), ("Cotton Plant",           2, 1),
-    ("Beehive",                2, 1), ("Giant Brown Mushroom",   2, 1),
-    ("Creature Nest",          1, 1),
+    // Common
+    ("Birch Tree (Variant 1)",20, 2), ("Birch Tree (Variant 2)",20, 2),
+    ("Dug-Up Wheat",          20, 1), ("Green Blob",            20, 1),
+    // Rare
+    ("Blue Blob",              5, 1), ("Red Blob",               5, 1),
+    ("Metal Vein",             5, 2), ("Large Metal Vein",       5, 2),
+    ("Stone Vein (White)",     5, 2),
+    // Super rare
+    ("Silver Vein",            2, 2), ("Dug-up Brown Mushroom",  2, 1),
+    ("Dug-up Pumpkin",         2, 1),
+    // Really really rare
+    ("Spawner - Nuts",         1, 1), ("Dug-Up Giant Pumpkin",   1, 2),
 ];
 
 fn biome_object_table(biome: i16) -> &'static [(&'static str, u32, u8)] {
@@ -664,6 +674,7 @@ impl WorldGenerator {
             BIOME_OCEAN_SHALLOW => (1, 3),
             BIOME_SNOW          => (1, 4),
             BIOME_DESERT        => (1, 4),
+            BIOME_SWAMP         => (1, 3),
             _                   => (2, 5),
         };
         let num_objects = min_obj + rng((max_obj - min_obj + 1) as u32) as usize;
@@ -805,6 +816,77 @@ impl WorldGenerator {
                             "Stone Vein" => {
                                 if rng(8) == 0 {
                                     place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            _ => {}
+                        },
+                        BIOME_WOODLANDS => match name {
+                            // Wheat always comes in small clusters of 2–5 (one placed, add 1–4).
+                            "Dug-Up Wheat" => {
+                                let n = 1 + rng(4);
+                                place_cluster("Dug-Up Wheat", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                            }
+                            // Brown mushrooms like clusters of 2–4 (add 1–3).
+                            "Dug-up Brown Mushroom" => {
+                                let n = 1 + rng(3);
+                                place_cluster("Dug-up Brown Mushroom", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                            }
+                            // Regular pumpkins rarely cluster (1–3 when they do).
+                            "Dug-up Pumpkin" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Dug-up Pumpkin", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            // Veins cluster; the large variant is a rare cluster seed.
+                            "Metal Vein" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Large Metal Vein" => {
+                                if rng(3) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Stone Vein (White)" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Stone Vein (White)", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Silver Vein" => {
+                                if rng(3) == 0 {
+                                    place_cluster("Silver Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            _ => {}
+                        },
+                        BIOME_SWAMP => match name {
+                            // Swamp clusters are small (1–2, rarely 3) and spaced out (radius 3).
+                            "Stone Vein" => {
+                                if rng(3) == 0 {
+                                    let n = if rng(10) == 0 { 2 } else { 1 };
+                                    place_cluster("Stone Vein", 2, n, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Metal Vein" => {
+                                if rng(3) == 0 {
+                                    let n = if rng(10) == 0 { 2 } else { 1 };
+                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            // Large veins rarely seed clusters here, and fill with the small variant.
+                            "Large Metal Vein" => {
+                                if rng(5) == 0 {
+                                    place_cluster("Metal Vein", 2, 1, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Dug-up Brown Mushroom" => {
+                                if rng(3) == 0 {
+                                    place_cluster("Dug-up Brown Mushroom", 1, 1, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
                                 }
                             }
                             _ => {}
