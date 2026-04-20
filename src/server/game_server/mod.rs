@@ -22,6 +22,7 @@ pub mod packets_client;
 pub mod packets_server;
 pub mod persist;
 pub mod registry_client;
+pub mod special_generators;
 pub mod world_state;
 
 use std::collections::HashMap;
@@ -334,6 +335,24 @@ fn parse_shack_info(data: &[u8]) -> Option<(i32, String)> {
         if key == "shack_id" { shack_id = Some(val); }
     }
     Some((shack_id?, item_id?))
+}
+
+/// Returns the `item_id` string from a wire-format InventoryItem blob, or None.
+fn parse_item_id(data: &[u8]) -> Option<String> {
+    let mut off = 0usize;
+    macro_rules! need { ($n:expr) => { if off + $n > data.len() { return None; } } }
+    macro_rules! ru16 { () => {{ need!(2); let v = u16::from_le_bytes([data[off], data[off+1]]); off += 2; v as usize }} }
+    macro_rules! read_str { () => {{ let (s, next) = unpack_string(data, off); if next == off { return None; } off = next; s }} }
+
+    let n_shorts = ru16!();
+    for _ in 0..n_shorts { let _ = read_str!(); need!(2); off += 2; }
+    let n_strings = ru16!();
+    for _ in 0..n_strings {
+        let key = read_str!();
+        let val = read_str!();
+        if key == "item_id" { return Some(val); }
+    }
+    None
 }
 
 /// Rewrite the `currently_using` string inside a stored OPD blob.
@@ -1286,6 +1305,7 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                             elements: params.elements.into_iter()
                                                 .map(|p| ChunkElement { cell_x: p.cell_x, cell_z: p.cell_z, rotation: p.rotation, item_data: p.item_data })
                                                 .collect(),
+                                            land_claims: HashMap::new(),
                                         }
                                     });
                                     chunk.elements.push(ChunkElement {
@@ -1294,14 +1314,26 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                                     });
                                     drop(chunks);
                                     // Register zone for any item that carries a shack_id.
-                                    if let Some((shack_id, _)) = parse_shack_info(&item_bytes) {
+                                    if let Some((shack_id, item_id)) = parse_shack_info(&item_bytes) {
                                         let zone_name = format!("shack{}", shack_id);
+                                        let kind = special_generators::zone_kind_from_item_id(&item_id);
                                         ws.zones.write().unwrap().insert(zone_name,
                                             world_state::ZoneEntry::interior(world_state::InteriorData {
-                                                item_bytes, rotation, cx, cz, tx, tz,
+                                                item_bytes: item_bytes.clone(), rotation, cx, cz, tx, tz,
                                                 outer_zone: zone_str.clone(),
+                                                kind,
                                             })
                                         );
+                                    }
+                                    // Add land claim to 3×3 neighbourhood.
+                                    let days = parse_item_id(&item_bytes).and_then(|id| match id.as_str() {
+                                        "10-day Land Claim" => Some(10u64),
+                                        "30-day Land Claim" => Some(30u64),
+                                        "Admin Land Claim"  => Some(99_999u64),
+                                        _ => None,
+                                    });
+                                    if let Some(d) = days {
+                                        ws.add_land_claims(&zone_str, cx, cz, tx as i16, tz as i16, uid, d);
                                     }
                                 }
                             }
@@ -1574,13 +1606,51 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
+            // ── CHANGE_LAND_USER (0x23) ───────────────────────────────────
+            // C→S: [validator:Str][zone:Str][i16 cx][i16 cz][i16 ix][i16 iz][u8 user_index][str new_username][str×9 cache_keys]
+            // S→C: [0x23][str zone][i16 cx][i16 cz][i16 ix][i16 iz][u8 user_index][str new_username]
+            0x23 => {
+                if let Some(ref uid) = player_id {
+                    let (_, mut off) = unpack_string(data, 10); // skip validator
+                    let (zone, next) = unpack_string(data, off); off = next;
+                    if off + 9 <= data.len() {
+                        let cx = i16::from_le_bytes([data[off], data[off+1]]); off += 2;
+                        let cz = i16::from_le_bytes([data[off], data[off+1]]); off += 2;
+                        let ix = i16::from_le_bytes([data[off], data[off+1]]); off += 2;
+                        let iz = i16::from_le_bytes([data[off], data[off+1]]); off += 2;
+                        let user_index = data[off]; off += 1;
+                        let (new_username, _) = unpack_string(data, off);
+
+                        if let SessionMode::Managed(ref ws) = session.mode {
+                            ws.update_land_claim_user(&zone, cx, cz, ix, iz, user_index, &new_username);
+                        }
+
+                        let mut pkt = vec![0x23u8];
+                        pkt.extend(pack_string(&zone));
+                        pkt.extend_from_slice(&cx.to_le_bytes());
+                        pkt.extend_from_slice(&cz.to_le_bytes());
+                        pkt.extend_from_slice(&ix.to_le_bytes());
+                        pkt.extend_from_slice(&iz.to_le_bytes());
+                        pkt.push(user_index);
+                        pkt.extend(pack_string(&new_username));
+                        session.broadcast(&pkt, None);
+                    } else {
+                        // Malformed — relay raw with player prefix
+                        let mut pkt = vec![0x23u8];
+                        pkt.extend(pack_string(uid));
+                        pkt.extend_from_slice(&data[10..]);
+                        session.broadcast(&pkt, Some(uid.as_str()));
+                    }
+                }
+            }
+
             // ── Global player-prefixed relay ────────────────────────────
             // Packets where S→C format has [str player_name] and all
             // players need to see it regardless of zone.
-            // 0x23 LAND_CLAIM, 0x4A (unknown), 0x56 RESPAWN,
+            // 0x4A (unknown), 0x56 RESPAWN,
             // 0x57 RETURNING_TO_BREEDER, 0x58 UPDATE_SYNCED_TARGETS,
             // 0x59 CREATED_LOCAL_MOB, 0x5A BANDIT_FLAG_DESTROYED
-            0x23 | 0x4A | 0x56 | 0x57 | 0x58 | 0x59 | 0x5A => {
+            0x4A | 0x56 | 0x57 | 0x58 | 0x59 | 0x5A => {
                 if let Some(ref uid) = player_id {
                     let mut pkt = vec![pid];
                     pkt.extend(pack_string(uid));
@@ -1810,11 +1880,34 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── CLAIM_OBJECT (0x27) / RELEASE_INTERACTING (0x28) ────────
-            // 0x27: [str obj_str] — relay to host for object ownership
+            // 0x27 C→S: [validator:Str][str claim_key]  ("zone,cx,cz,ix,iz")
+            //   In managed mode: re-send the chunk so the client has fresh land-claim data.
             // 0x28: empty — relay to host
             0x27 | 0x28 => {
                 if let Some(ref uid) = player_id {
-                    if matches!(session.mode, SessionMode::Relay) {
+                    if pid == 0x27 {
+                        if let SessionMode::Managed(ref ws) = session.mode {
+                            let (_, off) = unpack_string(data, 10); // skip validator
+                            let (claim_key, _) = unpack_string(data, off);
+                            // claim_key format: "zone,cx,cz,ix,iz"
+                            let parts: Vec<&str> = claim_key.splitn(5, ',').collect();
+                            if parts.len() == 5 {
+                                if let (Ok(cx), Ok(cz)) = (parts[1].parse::<i16>(), parts[2].parse::<i16>()) {
+                                    let wire = ws.get_chunk_wire(parts[0], cx, cz);
+                                    let _ = write_payload(&mut stream, 2, &wire);
+                                }
+                            }
+                        } else if matches!(session.mode, SessionMode::Relay) {
+                            let host = session.host.lock().unwrap().clone();
+                            if let Some(ref hname) = host {
+                                let mut relay = vec![pid];
+                                relay.extend(pack_string(uid));
+                                relay.extend_from_slice(&data[10..]);
+                                session.send_to(hname, &relay);
+                            }
+                        }
+                    } else if matches!(session.mode, SessionMode::Relay) {
+                        // 0x28 relay to host
                         let host = session.host.lock().unwrap().clone();
                         if let Some(ref hname) = host {
                             let mut relay = vec![pid];

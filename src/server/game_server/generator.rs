@@ -202,7 +202,7 @@ fn biome_object_table(biome: i16) -> &'static [(&'static str, u32, u8)] {
 
 /// Encodes an item name into the InventoryItem wire format.
 /// Format: u16(0 shorts) | u16(1 string) | str("item_id") | str(name) | u16(0 ints)
-fn pack_item(name: &str) -> Vec<u8> {
+pub fn pack_item(name: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&0u16.to_le_bytes()); // 0 short props
     p.extend_from_slice(&1u16.to_le_bytes()); // 1 string prop

@@ -48,10 +48,10 @@ use std::sync::RwLock;
 
 use super::baskets::BasketStore;
 use super::generator::{BiomeWeights, WorldGenerator, WorldTemplate, ZoneConfig};
-use super::world_state::{Chunk, ChunkElement, WorldState, ZoneEntry};
+use super::world_state::{Chunk, ChunkElement, LandClaim, WorldState, ZoneEntry};
 
 const MAGIC: &[u8; 4] = b"HAMP";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 pub const FILE_NAME: &str = "world.hws";
 
 // ── Low-level write helpers ───────────────────────────────────────────────
@@ -150,6 +150,14 @@ fn write_state<W: Write>(state: &WorldState, w: &mut W) -> io::Result<()> {
             wu8(w, el.rotation)?;
             wbytes(w, &el.item_data)?;
         }
+        wu16(w, chunk.land_claims.len() as u16)?;
+        for claim in chunk.land_claims.values() {
+            wstr(w, &claim.claim_key)?;
+            wstr(w, &claim.user0)?;
+            wstr(w, &claim.user1)?;
+            wstr(w, &claim.user2)?;
+            wu64(w, claim.expires_at_secs)?;
+        }
     }
 
     // Containers (reserved)
@@ -174,7 +182,7 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a HAMP world file"));
     }
     let version = ru8(&mut r)?;
-    if version != 1 && version != 2 {
+    if version != 1 && version != 2 && version != 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported world file version {version}"),
@@ -242,8 +250,20 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
                 item_data: rbytes(&mut r)?,
             });
         }
+        let mut land_claims = std::collections::HashMap::new();
+        if version >= 3 {
+            let claim_count = ru16(&mut r)? as usize;
+            for _ in 0..claim_count {
+                let claim_key      = rstr(&mut r)?;
+                let user0          = rstr(&mut r)?;
+                let user1          = rstr(&mut r)?;
+                let user2          = rstr(&mut r)?;
+                let expires_at_secs = ru64(&mut r)?;
+                land_claims.insert(claim_key.clone(), LandClaim { claim_key, user0, user1, user2, expires_at_secs });
+            }
+        }
         chunks.entry(zone.clone()).or_default()
-            .insert((x, z), Chunk { x, z, zone, biome, floor_rot, floor_tex, floor_model, mob_a, mob_b, elements });
+            .insert((x, z), Chunk { x, z, zone, biome, floor_rot, floor_tex, floor_model, mob_a, mob_b, elements, land_claims });
     }
 
     // Containers (reserved — skip count, nothing to read)

@@ -16,10 +16,14 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::defs::packet::pack_string;
 use crate::server::game_server::baskets::BasketStore;
 use crate::server::game_server::generator::{PlacedObject, WorldGenerator, WorldTemplate};
+use crate::server::game_server::special_generators::{
+    self, ZoneKind,
+};
 
 // ── Position / rotation types ─────────────────────────────────────────────
 
@@ -53,6 +57,46 @@ impl Default for WorldRotation {
     }
 }
 
+// ── Land claim ────────────────────────────────────────────────────────────
+
+/// A land claim on a chunk.  The claim_key has format "zone,chunkX,chunkZ,innerX,innerZ".
+/// The same claim is stored on all 3×3 neighbouring chunks for proximity checks.
+pub struct LandClaim {
+    pub claim_key: String,
+    /// Owner username.
+    pub user0: String,
+    /// Trusted user slot 1.
+    pub user1: String,
+    /// Trusted user slot 2.
+    pub user2: String,
+    /// Unix seconds at expiry.
+    pub expires_at_secs: u64,
+}
+
+impl LandClaim {
+    pub fn new(claim_key: String, owner: String, days: u64) -> Self {
+        let expires_at_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+            + days * 86400;
+        Self { claim_key, user0: owner, user1: String::new(), user2: String::new(), expires_at_secs }
+    }
+
+    fn is_expired(&self) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.expires_at_secs <= now
+    }
+
+    fn remaining_dhms(&self) -> (i16, i16, i16, i16) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let total = self.expires_at_secs.saturating_sub(now);
+        let d = (total / 86400) as i16;
+        let h = ((total % 86400) / 3600) as i16;
+        let m = ((total % 3600) / 60) as i16;
+        let s = (total % 60) as i16;
+        (d, h, m, s)
+    }
+}
+
 // ── Chunk element (placed object) ─────────────────────────────────────────
 
 /// A single placed object within a chunk cell.
@@ -80,7 +124,7 @@ pub struct Chunk {
     pub mob_a: String,
     pub mob_b: String,
     pub elements: Vec<ChunkElement>,
-    // timers omitted for now — add when land claims are needed
+    pub land_claims: HashMap<String, LandClaim>,
 }
 
 impl Chunk {
@@ -97,6 +141,7 @@ impl Chunk {
             mob_a: String::new(),
             mob_b: String::new(),
             elements: Vec::new(),
+            land_claims: HashMap::new(),
         }
     }
 
@@ -148,8 +193,22 @@ impl Chunk {
             }
         }
 
-        // land_claim_count = 0
-        p.extend_from_slice(&0i16.to_le_bytes());
+        // land claims
+        let active: Vec<&LandClaim> = self.land_claims.values()
+            .filter(|c| !c.is_expired())
+            .collect();
+        p.extend_from_slice(&(active.len() as i16).to_le_bytes());
+        for claim in &active {
+            let (d, h, m, s) = claim.remaining_dhms();
+            p.extend(pack_string(&claim.claim_key));
+            p.extend(pack_string(&claim.user0));
+            p.extend(pack_string(&claim.user1));
+            p.extend(pack_string(&claim.user2));
+            p.extend_from_slice(&d.to_le_bytes());
+            p.extend_from_slice(&h.to_le_bytes());
+            p.extend_from_slice(&m.to_le_bytes());
+            p.extend_from_slice(&s.to_le_bytes());
+        }
         // bandit_camp_count = 0 (read by case 0x0D outer handler via GetShort)
         p.extend_from_slice(&0i16.to_le_bytes());
         p
@@ -194,6 +253,7 @@ pub struct InteriorData {
     pub tx: i16,
     pub tz: i16,
     pub outer_zone: String,
+    pub kind: ZoneKind,
 }
 
 /// One entry in the zone registry.
@@ -252,6 +312,7 @@ impl WorldState {
                     mob_a:       params.mob_a,
                     mob_b:       params.mob_b,
                     elements:    params.elements.into_iter().map(placed_to_element).collect(),
+                    land_claims: HashMap::new(),
                 });
             }
         }
@@ -287,8 +348,49 @@ impl WorldState {
             }
         }
 
-        let worldgen = self.zones.read().unwrap()
-            .get(zone).map_or(false, |e| e.worldgen);
+        let zone_info = self.zones.read().unwrap().get(zone).map(|e| {
+            (e.worldgen, e.interior.as_ref().map(|i| i.kind.clone()))
+        });
+
+        let (worldgen, kind_opt) = zone_info.unwrap_or((false, None));
+
+        // Special interior worldgen for cave/cloud/hell zones.
+        if let Some(kind) = kind_opt {
+            let shack_id: i32 = zone.strip_prefix("shack")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let world_seed = self.generator.template().seed;
+
+            let (params, floor_model) = match &kind {
+                ZoneKind::Hell => (special_generators::generate_hell_chunk(world_seed, shack_id, x, z), 0i16),
+                ZoneKind::Cloud => (special_generators::generate_cloud_chunk(world_seed, shack_id, x, z), 0i16),
+                ZoneKind::Cave { item_id } => {
+                    let fm = special_generators::cave_floor_model(item_id);
+                    (special_generators::generate_cave_chunk(world_seed, shack_id, x, z, item_id), fm)
+                }
+                ZoneKind::House => return Chunk::blank(x, z, zone).to_wire(),
+            };
+
+            let chunk = Chunk {
+                x, z,
+                zone:        zone.to_string(),
+                biome:       params.biome,
+                floor_rot:   params.floor_rot,
+                floor_tex:   params.floor_tex,
+                floor_model,
+                mob_a:       params.mob_a,
+                mob_b:       params.mob_b,
+                elements:    params.elements.into_iter().map(placed_to_element).collect(),
+                land_claims: HashMap::new(),
+            };
+            let wire = chunk.to_wire();
+            self.chunks.write().unwrap()
+                .entry(zone.to_string())
+                .or_default()
+                .insert((x, z), chunk);
+            return wire;
+        }
+
         if !worldgen {
             return Chunk::blank(x, z, zone).to_wire();
         }
@@ -305,6 +407,7 @@ impl WorldState {
             mob_a:       params.mob_a,
             mob_b:       params.mob_b,
             elements:    params.elements.into_iter().map(placed_to_element).collect(),
+            land_claims: HashMap::new(),
         };
         let wire = chunk.to_wire();
         self.chunks.write().unwrap()
@@ -312,5 +415,54 @@ impl WorldState {
             .or_default()
             .insert((x, z), chunk);
         wire
+    }
+
+    /// Adds a land claim to all 9 chunks in the 3×3 neighbourhood of (chunk_x, chunk_z).
+    /// The claim key is always relative to the centre chunk.
+    pub fn add_land_claims(&self, zone: &str, chunk_x: i16, chunk_z: i16, inner_x: i16, inner_z: i16, owner: &str, days: u64) {
+        let claim_key = format!("{},{},{},{},{}", zone, chunk_x, chunk_z, inner_x, inner_z);
+        let mut chunks = self.chunks.write().unwrap();
+        let worldgen = self.zones.read().unwrap().get(zone).map_or(false, |e| e.worldgen);
+        for dx in -1i16..=1 {
+            for dz in -1i16..=1 {
+                let cx = chunk_x + dx;
+                let cz = chunk_z + dz;
+                let chunk = chunks.entry(zone.to_string()).or_default()
+                    .entry((cx, cz)).or_insert_with(|| {
+                        if worldgen {
+                            let p = self.generator.chunk_params(zone, cx as i32, cz as i32);
+                            Chunk {
+                                x: cx, z: cz, zone: zone.to_string(),
+                                biome: p.biome, floor_rot: p.floor_rot,
+                                floor_tex: p.floor_tex, floor_model: 0,
+                                mob_a: p.mob_a, mob_b: p.mob_b,
+                                elements: p.elements.into_iter().map(placed_to_element).collect(),
+                                land_claims: HashMap::new(),
+                            }
+                        } else {
+                            Chunk::blank(cx, cz, zone)
+                        }
+                    });
+                chunk.land_claims.insert(claim_key.clone(), LandClaim::new(claim_key.clone(), owner.to_string(), days));
+            }
+        }
+    }
+
+    /// Updates a single user slot on the claim at (chunk_x, chunk_z, inner_x, inner_z).
+    /// user_index: 0 = owner (user0), 1 = user1, 2 = user2.
+    pub fn update_land_claim_user(&self, zone: &str, chunk_x: i16, chunk_z: i16, inner_x: i16, inner_z: i16, user_index: u8, username: &str) {
+        let claim_key = format!("{},{},{},{},{}", zone, chunk_x, chunk_z, inner_x, inner_z);
+        if let Some(chunk) = self.chunks.write().unwrap()
+            .get_mut(zone).and_then(|m| m.get_mut(&(chunk_x, chunk_z)))
+        {
+            if let Some(claim) = chunk.land_claims.get_mut(&claim_key) {
+                match user_index {
+                    0 => claim.user0 = username.to_string(),
+                    1 => claim.user1 = username.to_string(),
+                    2 => claim.user2 = username.to_string(),
+                    _ => {}
+                }
+            }
+        }
     }
 }
