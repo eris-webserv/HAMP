@@ -102,66 +102,111 @@ pub struct PlacedObject {
 // ── Object spawn tables ───────────────────────────────────────────────────
 //
 // (item_name, weight, tile_size)
-//   weight:    relative spawn probability (higher = more common)
-//   tile_size: footprint — 1=1×1, 2=2×2, 3=3×3, 5=5×5
+//   Common:      weight 20
+//   Rare:        weight  5
+//   Really rare: weight  2
+//   Super rare:  weight  1
 //
-// OceanShallow (5) reuses Ocean (4). SwampDark (7) reuses Swamp (6).
-// RE'd from the Python reference implementation (segual/game_server.py).
+// OceanShallow (5) and SwampDark (7) have dedicated tables.
 
 static OBJECTS_GRASS: &[(&str, u32, u8)] = &[
-    ("Birch Tree (Variant 1)", 8, 2), ("Birch Tree (Variant 2)", 6, 2),
-    ("Mossy Tree",             4, 2), ("Willow Tree",            2, 2),
-    ("Stone Vein",             3, 2), ("Metal Vein",             1, 1),
-    ("Spawner - Sticks",       5, 1), ("Spawner - Bones",        2, 1),
-    ("Spawner - Nuts",         3, 1), ("Berry Bush",             4, 1),
-    ("Flowers",                6, 1), ("Cotton Plant",           2, 1),
-    ("Creature Nest",          1, 1), ("Beehive",                1, 1),
-    ("Lavender Bush",          2, 1), ("Tea Tree",               2, 1),
+    // Common
+    ("Metal Vein",            12, 2), ("Green Blob",            20, 1),
+    ("Spawner - Sticks",      20, 1), ("Stone Vein",            12, 2),
+    // Rare
+    ("Cotton Plant",           2, 1), ("Large Stone Vein",       3, 2),
+    ("Large Metal Vein",       3, 2), ("Spawner - Nuts",         5, 1),
+    ("Red Blob",               5, 1), ("Pond",                   5, 3),
+    ("Mossy Tree",             5, 2), ("Ancient Pillars",        5, 2),
+    // Really rare
+    ("Large Emerald Vein",     1, 2), ("Emerald Vein",           1, 2),
+    ("Blue Blob",              2, 1), ("Beehive",                2, 1),
 ];
 
 static OBJECTS_SNOW: &[(&str, u32, u8)] = &[
-    ("Frozen Tree",            8, 2), ("Evergreen Tree",         6, 2),
-    ("Stone Vein (Snowy)",     4, 2), ("Silver Vein",            2, 1),
-    ("Ice Shard Vein",         2, 1), ("Spawner - Snowballs",    5, 1),
-    ("Spawner - Sticks",       3, 1), ("Spawner - Bones",        2, 1),
-    ("Creature Nest",          1, 1),
+    // Common
+    ("Green Blob",            20, 1), ("Stone Vein (Snowy)",    12, 2),
+    // Rare
+    ("Red Blob",               5, 1), ("Frozen Pond",            5, 3),
+    ("Snowman",                5, 1), ("Frozen Tree",            5, 2),
+    ("Titanium Vein",          3, 2),
+    // Really rare
+    ("Blue Blob",              2, 1), ("MoonBerry Bush",         2, 1),
 ];
 
 static OBJECTS_DESERT: &[(&str, u32, u8)] = &[
-    ("Palm Tree",              8, 2), ("Cactus",                 6, 1),
-    ("Stone Vein (Desert)",    4, 2), ("Gold Vein",              2, 1),
-    ("Spawner - Sticks",       3, 1), ("Spawner - Bones",        3, 1),
-    ("Spawner - Coconuts",     4, 1), ("Spawner - Fossils",      2, 1),
-    ("Hot Pepper Plant",       2, 1), ("Creature Nest",          1, 1),
+    // Common (blobs deliberately less common)
+    ("Stone Vein (Desert)",   12, 2), ("Cactus",                20, 1),
+    ("Green Blob",             8, 1),
+    // Rare
+    ("Uranium Vein",           3, 2), ("Gold Vein",              3, 2),
+    ("Red Blob",               3, 1),
+    // Really rare
+    ("Blue Blob",              2, 1), ("Spawner - Sticks",       2, 1),
 ];
 
 static OBJECTS_EVERGREEN: &[(&str, u32, u8)] = &[
-    ("Evergreen Tree",        10, 2), ("Large Mossy Tree",       3, 2),
-    ("Mossy Tree",             4, 2), ("Stone Vein",             3, 2),
-    ("Metal Vein",             2, 1), ("Titanium Vein",          1, 1),
-    ("Spawner - Sticks",       5, 1), ("Spawner - Nuts",         3, 1),
-    ("Spawner - Bones",        2, 1), ("Berry Bush",             3, 1),
-    ("Giant Brown Mushroom",   2, 1), ("Giant Red Mushroom",     1, 1),
-    ("Beehive",                1, 1), ("Creature Nest",          1, 1),
-    ("Spiderhive",             1, 1),
+    // Common
+    ("Evergreen Tree",        20, 2), ("Tar Pit",               20, 2),
+    ("Dug-up Brown Mushroom", 20, 1), ("Salmonberry Bush",      20, 1),
+    ("Stone Vein",            12, 2), ("Spawner - Sticks",      20, 1),
+    ("Green Blob",            20, 1),
+    // Rare
+    ("Large Stone Vein",       3, 2), ("Dug-Up Red Mushroom",   5, 1),
+    ("Gold Vein",              3, 2),
+    // Really rare
+    ("Blue Blob",              2, 1), ("Metal Vein",             2, 2),
+    ("Giant Red Mushroom",     2, 1),
+    // Super rare
+    ("Large Ruby Vein",        1, 2), ("Ruby Vein",              1, 2),
 ];
 
+// Spirit Tree is here; Spirit Branch is placed as a cluster off Spirit Tree.
+static OBJECTS_SAKURA: &[(&str, u32, u8)] = &[
+    // Common
+    ("Green Blob",            20, 1), ("Stone Vein (Sakura)",   12, 2),
+    ("Sakura Tree",           20, 2),
+    // Rare
+    ("Red Blob",               5, 1), ("Flowers",                5, 1),
+    ("Sakura Pond",            5, 3), ("Stone Lantern",          5, 1),
+    // Really rare
+    ("Amethyst Vein",          2, 2), ("Lavender Bush",          2, 1),
+    ("Blue Blob",              2, 1), ("Spawner - Sticks",       2, 1),
+    ("Titanium Vein (Sakura)", 2, 2),
+    // Super rare
+    ("Spirit Tree",            1, 3),
+];
+
+// Ocean: shell spawners are super-rare; Stone Vein is rare.
+// Chunk object count is capped at 1–3 (see generate_chunk_elements).
 static OBJECTS_OCEAN: &[(&str, u32, u8)] = &[
-    ("Stone Vein (Ocean)",     4, 2),
-    ("Spawner - Red Shells",   3, 1), ("Spawner - Blue Shells",  3, 1),
-    ("Spawner - Green Shells", 3, 1), ("Spawner - Purple Shells",2, 1),
-    ("Spawner - White Shells", 2, 1), ("Spawner - Black Shells", 1, 1),
-    ("Spawner - Gold Shells",  1, 1), ("Spawner - Bones",        2, 1),
+    // Rare
+    ("Stone Vein (Ocean)",     5, 2),
+    // Super rare
+    ("Spawner - Blue Shells",  1, 1), ("Spawner - White Shells", 1, 1),
+    ("Spawner - Green Shells", 1, 1), ("Spawner - Purple Shells",1, 1),
+    ("Spawner - Black Shells", 1, 1), ("Spawner - Red Shells",   1, 1),
+    ("Spawner - Gold Shells",  1, 1),
 ];
 
+// OceanShallow = beachside: Palm Trees only.
+static OBJECTS_OCEAN_SHALLOW: &[(&str, u32, u8)] = &[
+    ("Palm Tree",              1, 2),
+];
+
+// Swamp (regular): not explicitly specified, keep original character.
 static OBJECTS_SWAMP: &[(&str, u32, u8)] = &[
     ("Willow Tree",            6, 2), ("Mossy Tree",             5, 2),
     ("Rotting Stump",          4, 1), ("Stone Vein",             3, 2),
     ("Spawner - Sticks",       4, 1), ("Spawner - Bones",        3, 1),
-    ("Spawner - Spirit Branch",2, 1), ("Giant Purple Mushroom",  3, 1),
-    ("Giant Brown Mushroom",   2, 1), ("Lavender Bush",          2, 1),
-    ("Spiderhive",             2, 1), ("Creature Nest",          1, 1),
-    ("Lava",                   1, 1),
+    ("Giant Purple Mushroom",  3, 1), ("Giant Brown Mushroom",   2, 1),
+    ("Lavender Bush",          2, 1), ("Spiderhive",             2, 1),
+    ("Creature Nest",          1, 1), ("Lava",                   1, 1),
+];
+
+// SwampDark = swamp lake: only a very rare Stone Vein (70% chance of nothing).
+static OBJECTS_SWAMP_DARK: &[(&str, u32, u8)] = &[
+    ("Stone Vein",             1, 2),
 ];
 
 static OBJECTS_WOODLANDS: &[(&str, u32, u8)] = &[
@@ -176,27 +221,19 @@ static OBJECTS_WOODLANDS: &[(&str, u32, u8)] = &[
     ("Creature Nest",          1, 1),
 ];
 
-static OBJECTS_SAKURA: &[(&str, u32, u8)] = &[
-    ("Sakura Tree",           10, 2), ("Birch Tree (Variant 1)", 3, 2),
-    ("Stone Vein (Sakura)",    3, 2), ("Titanium Vein (Sakura)", 1, 1),
-    ("Spawner - Sticks",       4, 1), ("Spawner - Nuts",         3, 1),
-    ("Berry Bush",             3, 1), ("MoonBerry Bush",         2, 1),
-    ("Salmonberry Bush",       2, 1), ("Flowers",                5, 1),
-    ("Lavender Bush",          3, 1), ("Tea Tree",               3, 1),
-    ("Beehive",                1, 1), ("Creature Nest",          1, 1),
-];
-
 fn biome_object_table(biome: i16) -> &'static [(&'static str, u32, u8)] {
     match biome as u8 {
-        BIOME_GRASS                           => OBJECTS_GRASS,
-        BIOME_SNOW                            => OBJECTS_SNOW,
-        BIOME_DESERT                          => OBJECTS_DESERT,
-        BIOME_EVERGREEN                       => OBJECTS_EVERGREEN,
-        BIOME_OCEAN | BIOME_OCEAN_SHALLOW     => OBJECTS_OCEAN,
-        BIOME_SWAMP | BIOME_SWAMP_DARK        => OBJECTS_SWAMP,
-        BIOME_WOODLANDS                       => OBJECTS_WOODLANDS,
-        BIOME_SAKURA                          => OBJECTS_SAKURA,
-        _                                     => OBJECTS_GRASS,
+        BIOME_GRASS         => OBJECTS_GRASS,
+        BIOME_SNOW          => OBJECTS_SNOW,
+        BIOME_DESERT        => OBJECTS_DESERT,
+        BIOME_EVERGREEN     => OBJECTS_EVERGREEN,
+        BIOME_OCEAN         => OBJECTS_OCEAN,
+        BIOME_OCEAN_SHALLOW => OBJECTS_OCEAN_SHALLOW,
+        BIOME_SWAMP         => OBJECTS_SWAMP,
+        BIOME_SWAMP_DARK    => OBJECTS_SWAMP_DARK,
+        BIOME_WOODLANDS     => OBJECTS_WOODLANDS,
+        BIOME_SAKURA        => OBJECTS_SAKURA,
+        _                   => OBJECTS_GRASS,
     }
 }
 
@@ -593,9 +630,9 @@ impl WorldGenerator {
     /// Generates natural objects for a chunk.
     ///
     /// Uses a per-chunk seeded RNG (independent from biome/floor RNG).
-    /// Picks 3–8 objects from the biome's weighted table with overlap prevention.
-    /// Multi-tile objects (size 2, 3, 5) occupy all covered cells in the
-    /// occupancy bitset but are stored as a single element at their top-left tile.
+    /// Object counts and clustering behaviour vary per biome.
+    /// Multi-tile objects occupy all covered cells in the occupancy bitset but
+    /// are stored as a single element at their top-left tile.
     fn generate_chunk_elements(&self, chunk_x: i32, chunk_z: i32, biome: i16) -> Vec<PlacedObject> {
         let table = biome_object_table(biome);
         if table.is_empty() {
@@ -603,7 +640,6 @@ impl WorldGenerator {
         }
 
         // Separate RNG stream from floor properties (uses 0x01/0x02 as salts).
-        // Salt 0x8000_0000+ is safely out of range of the floor salt space.
         let chunk_salt = (chunk_x as u64)
             .wrapping_mul(0x9e3779b97f4a7c15)
             .wrapping_add((chunk_z as u64).wrapping_mul(0x6c62272e07bb0142));
@@ -614,18 +650,29 @@ impl WorldGenerator {
             rng_u32(obj_seed, ctr) % modulus
         };
 
-        // Total weight for weighted pick
         let total_weight: u32 = table.iter().map(|e| e.1).sum();
 
-        // num_objects in [3, 8]
-        let num_objects = 3 + rng(6) as usize; // 0..5 → +3 → 3..8
+        // SwampDark: 70% chance the chunk is completely empty.
+        if biome as u8 == BIOME_SWAMP_DARK && rng(10) >= 3 {
+            return Vec::new();
+        }
 
-        // Occupied-tile bitset: bit (z * 10 + x) for a 10×10 chunk grid
+        // Per-biome base object count range [min, max].
+        let (min_obj, max_obj): (usize, usize) = match biome as u8 {
+            BIOME_SWAMP_DARK    => (0, 1),
+            BIOME_OCEAN         => (1, 2),
+            BIOME_OCEAN_SHALLOW => (1, 3),
+            BIOME_SNOW          => (1, 4),
+            BIOME_DESERT        => (1, 4),
+            _                   => (2, 5),
+        };
+        let num_objects = min_obj + rng((max_obj - min_obj + 1) as u32) as usize;
+
         let mut occupied: u128 = 0;
-        let mut elements = Vec::with_capacity(num_objects);
+        let mut elements: Vec<PlacedObject> = Vec::with_capacity(num_objects + 8);
+        let mut spirit_tree_pos: Option<(u8, u8)> = None;
 
         'outer: for _ in 0..num_objects {
-            // Weighted pick
             let mut roll = rng(total_weight);
             let mut chosen = &table[table.len() - 1];
             for entry in table {
@@ -636,37 +683,191 @@ impl WorldGenerator {
                 roll -= entry.1;
             }
             let (name, _, size) = *chosen;
-            let size = size as u32;
             let rotation = rng(4) as u8;
 
-            // Up to 10 placement attempts
             for _ in 0..10 {
-                let max_pos = 10u32.saturating_sub(size);
+                let max_pos = 10u32.saturating_sub(size as u32);
                 let tx = rng(max_pos + 1);
                 let tz = rng(max_pos + 1);
-
-                // Check all tiles the object occupies
                 let mut mask: u128 = 0;
-                for dz in 0..size {
-                    for dx in 0..size {
-                        let bit = (tz + dz) * 10 + (tx + dx);
-                        mask |= 1u128 << bit;
+                for dz in 0..(size as u32) {
+                    for dx in 0..(size as u32) {
+                        mask |= 1u128 << ((tz + dz) * 10 + (tx + dx));
                     }
                 }
-
                 if occupied & mask == 0 {
                     occupied |= mask;
+                    if name == "Spirit Tree" {
+                        spirit_tree_pos = Some((tx as u8, tz as u8));
+                    }
                     elements.push(PlacedObject {
                         cell_x:    tx as u8,
                         cell_z:    tz as u8,
                         rotation,
                         item_data: pack_item(name),
                     });
+
+                    // Biome-specific cluster spawning after placement.
+                    match biome as u8 {
+                        BIOME_GRASS => match name {
+                            "Metal Vein" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Large Metal Vein" => {
+                                if rng(2) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Stone Vein" => {
+                                if rng(8) == 0 {
+                                    place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Large Stone Vein" => {
+                                if rng(4) == 0 {
+                                    place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Cotton Plant" => {
+                                if rng(4) == 0 {
+                                    let n = 2 + rng(4);
+                                    place_cluster("Cotton Plant", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            _ => {}
+                        },
+                        BIOME_SNOW => match name {
+                            "MoonBerry Bush" => {
+                                let n = 1 + rng(4);
+                                place_cluster("MoonBerry Bush", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                            }
+                            "Titanium Vein" => {
+                                if rng(4) == 0 {
+                                    place_cluster("Titanium Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Stone Vein (Snowy)" => {
+                                if rng(8) == 0 {
+                                    place_cluster("Stone Vein (Snowy)", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            _ => {}
+                        },
+                        BIOME_DESERT => match name {
+                            "Gold Vein" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Gold Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Uranium Vein" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Uranium Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Stone Vein (Desert)" => {
+                                if rng(8) == 0 {
+                                    place_cluster("Stone Vein (Desert)", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            _ => {}
+                        },
+                        BIOME_EVERGREEN => match name {
+                            "Metal Vein" => {
+                                if rng(4) == 0 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Giant Red Mushroom" => {
+                                let r = 1 + rng(2);
+                                place_cluster("Dug-Up Red Mushroom", 1, r, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                let b = 1 + rng(2);
+                                place_cluster("Dug-up Brown Mushroom", 1, b, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                            }
+                            "Dug-up Brown Mushroom" => {
+                                if rng(10) < 2 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Dug-up Brown Mushroom", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Dug-Up Red Mushroom" => {
+                                if rng(10) < 2 {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Dug-Up Red Mushroom", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            "Stone Vein" => {
+                                if rng(8) == 0 {
+                                    place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                }
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+
                     continue 'outer;
                 }
             }
         }
 
+        // Sakura: very rarely place a Spirit Branch near any Spirit Tree that spawned.
+        if biome as u8 == BIOME_SAKURA {
+            if let Some((stx, stz)) = spirit_tree_pos {
+                if rng(5) == 0 {
+                    place_cluster("Spawner - Spirit Branch", 1, 1, stx, stz, 3, &mut occupied, &mut elements, &mut rng);
+                }
+            }
+        }
+
         elements
+    }
+}
+
+/// Places `count` copies of `name` (tile footprint `size`×`size`) within
+/// `radius` cells of `(anchor_x, anchor_z)`, respecting the occupancy bitset.
+fn place_cluster(
+    name:     &'static str,
+    size:     u8,
+    count:    u32,
+    anchor_x: u8,
+    anchor_z: u8,
+    radius:   i32,
+    occupied: &mut u128,
+    elements: &mut Vec<PlacedObject>,
+    rng:      &mut dyn FnMut(u32) -> u32,
+) {
+    let s   = size as i32;
+    let span = (radius * 2 + 1) as u32;
+    for _ in 0..count {
+        for _ in 0..10 {
+            let dx = rng(span) as i32 - radius;
+            let dz = rng(span) as i32 - radius;
+            let tx = (anchor_x as i32 + dx).clamp(0, 10 - s) as u32;
+            let tz = (anchor_z as i32 + dz).clamp(0, 10 - s) as u32;
+            let mut mask: u128 = 0;
+            for ddz in 0..(s as u32) {
+                for ddx in 0..(s as u32) {
+                    mask |= 1u128 << ((tz + ddz) * 10 + (tx + ddx));
+                }
+            }
+            if *occupied & mask == 0 {
+                *occupied |= mask;
+                let rotation = rng(4) as u8;
+                elements.push(PlacedObject {
+                    cell_x:    tx as u8,
+                    cell_z:    tz as u8,
+                    rotation,
+                    item_data: pack_item(name),
+                });
+                break;
+            }
+        }
     }
 }
