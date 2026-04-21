@@ -132,6 +132,8 @@ static OBJECTS_SNOW: &[(&str, u32, u8)] = &[
     ("Titanium Vein",          3, 2),
     // Really rare
     ("Blue Blob",              2, 1), ("MoonBerry Bush",         2, 1),
+    // Super rare
+    ("Spawner - Snowballs",    1, 1),
 ];
 
 static OBJECTS_DESERT: &[(&str, u32, u8)] = &[
@@ -177,21 +179,19 @@ static OBJECTS_SAKURA: &[(&str, u32, u8)] = &[
     ("Spirit Tree",            1, 3),
 ];
 
-// Ocean: shells are extremely rare — hard to find even 3 in a whole ocean.
-// Stone Vein dominates so shell rolls almost always lose.
+// Ocean: deep water, stone veins only. Shells spawn on the beach (OceanShallow).
 static OBJECTS_OCEAN: &[(&str, u32, u8)] = &[
-    // Common (relative to the rest of the table)
-    ("Stone Vein (Ocean)",    80, 2),
-    // Super rare — each shell ~0.18% per roll
-    ("Spawner - Blue Shells",  1, 1), ("Spawner - White Shells", 1, 1),
-    ("Spawner - Green Shells", 1, 1), ("Spawner - Purple Shells",1, 1),
-    ("Spawner - Black Shells", 1, 1), ("Spawner - Red Shells",   1, 1),
-    ("Spawner - Gold Shells",  1, 1),
+    ("Stone Vein (Ocean)", 1, 2),
 ];
 
-// OceanShallow = beachside: Palm Trees only.
+// OceanShallow = beach: Palm Trees with shells washed ashore.
+// Coconut spawners (1 per beach chunk) are placed unconditionally after the main loop.
 static OBJECTS_OCEAN_SHALLOW: &[(&str, u32, u8)] = &[
-    ("Palm Tree",              1, 2),
+    ("Palm Tree",              10, 2),
+    ("Spawner - Blue Shells",   2, 1), ("Spawner - White Shells",  2, 1),
+    ("Spawner - Green Shells",  2, 1), ("Spawner - Purple Shells", 2, 1),
+    ("Spawner - Black Shells",  2, 1), ("Spawner - Red Shells",    2, 1),
+    ("Spawner - Gold Shells",   2, 1),
 ];
 
 // Swamp: more spaced out than other biomes; cluster logic uses small
@@ -577,14 +577,13 @@ impl WorldGenerator {
         }
 
         // Post-processing — RE: ChunkControl$GenerateNewBiomeMap
-        //   ocean blobs: 13% chance → OceanShallow
         //   swamp blobs: 50% chance → SwampDark
+        //   ocean→OceanShallow is handled per-chunk in chunk_params (thin 1-2 chunk beach strips).
         for blob_id in 0..36usize {
             let post_salt = (blob_id as u64).wrapping_add(0x8000_0000);
             let roll = rng_u32(base_seed, post_salt) % 100;
             match blob_biomes[blob_id] {
-                BIOME_OCEAN  if roll < 13 => { blob_biomes[blob_id] = BIOME_OCEAN_SHALLOW; }
-                BIOME_SWAMP  if roll < 50 => { blob_biomes[blob_id] = BIOME_SWAMP_DARK; }
+                BIOME_SWAMP if roll < 50 => { blob_biomes[blob_id] = BIOME_SWAMP_DARK; }
                 _ => {}
             }
         }
@@ -612,6 +611,19 @@ impl WorldGenerator {
             && (self.template.start_biome as usize) < BIOME_TEXTURE_COUNTS.len()
         {
             biome = self.template.start_biome;
+        }
+
+        // Beach: convert ~5% of ocean chunks to OceanShallow per-chunk so beaches appear as
+        // thin 1-2 chunk strips within ocean areas (always adjacent to ocean).
+        if biome as u8 == BIOME_OCEAN {
+            let beach_hash = splitmix64(
+                self.template.seed
+                    ^ (chunk_x as u64).wrapping_mul(0xd6e8feb86659fd93)
+                    ^ (chunk_z as u64).wrapping_mul(0xd2a98b26625eee7b),
+            );
+            if beach_hash % 100 < 5 {
+                biome = BIOME_OCEAN_SHALLOW as i16;
+            }
         }
 
         // Per-chunk floor properties: seeded by world seed ^ chunk coords
@@ -644,6 +656,11 @@ impl WorldGenerator {
     /// Multi-tile objects occupy all covered cells in the occupancy bitset but
     /// are stored as a single element at their top-left tile.
     fn generate_chunk_elements(&self, chunk_x: i32, chunk_z: i32, biome: i16) -> Vec<PlacedObject> {
+        // Spawn-pad chunks are kept clear of all natural objects.
+        if matches!((chunk_x, chunk_z), (-1, 0) | (-1, 1) | (-2, 0) | (-2, 1)) {
+            return Vec::new();
+        }
+
         let table = biome_object_table(biome);
         if table.is_empty() {
             return Vec::new();
@@ -682,6 +699,27 @@ impl WorldGenerator {
         let mut occupied: u128 = 0;
         let mut elements: Vec<PlacedObject> = Vec::with_capacity(num_objects + 8);
         let mut spirit_tree_pos: Option<(u8, u8)> = None;
+        let mut has_mossy_tree = false;
+
+        // Grass area character: 0 = vein-heavy, 1 = tree-heavy, 2 = balanced.
+        // Zones are ~8 chunks wide. Balanced is the most common outcome (60%);
+        // vein-heavy and tree-heavy each occur ~20% of the time.
+        let grass_mode: u8 = if biome as u8 == BIOME_GRASS {
+            let cx = (chunk_x >> 3) as u64;
+            let cz = (chunk_z >> 3) as u64;
+            let raw = splitmix64(
+                self.template.seed
+                    ^ cx.wrapping_mul(0x9e3779b97f4a7c15)
+                    .wrapping_add(cz.wrapping_mul(0x6c62272e07bb0142)),
+            ) % 5;
+            match raw {
+                0 => 0, // vein-heavy  (20%)
+                1 => 1, // tree-heavy  (20%)
+                _ => 2, // balanced    (60%)
+            }
+        } else {
+            2
+        };
 
         'outer: for _ in 0..num_objects {
             let mut roll = rng(total_weight);
@@ -711,6 +749,9 @@ impl WorldGenerator {
                     if name == "Spirit Tree" {
                         spirit_tree_pos = Some((tx as u8, tz as u8));
                     }
+                    if name == "Mossy Tree" {
+                        has_mossy_tree = true;
+                    }
                     elements.push(PlacedObject {
                         cell_x:    tx as u8,
                         cell_z:    tz as u8,
@@ -721,32 +762,91 @@ impl WorldGenerator {
                     // Biome-specific cluster spawning after placement.
                     match biome as u8 {
                         BIOME_GRASS => match name {
-                            "Metal Vein" => {
-                                if rng(4) == 0 {
+                            // Tree density varies by grass_mode: 0=vein-heavy (1-2 sparse trees),
+                            // 1=tree-heavy (dense), 2=balanced (light cluster). All use wide spacing.
+                            "Mossy Tree" => match grass_mode {
+                                0 => {
+                                    // Vein-heavy: still place 1-2 trees but spread out
                                     let n = 1 + rng(2);
+                                    place_cluster("Mossy Tree", 2, n, tx as u8, tz as u8, 5, &mut occupied, &mut elements, &mut rng);
+                                }
+                                1 => {
+                                    let n = 2 + rng(3);
+                                    place_cluster("Mossy Tree", 2, n, tx as u8, tz as u8, 5, &mut occupied, &mut elements, &mut rng);
+                                }
+                                _ => {
+                                    let n = 1 + rng(2);
+                                    place_cluster("Mossy Tree", 2, n, tx as u8, tz as u8, 4, &mut occupied, &mut elements, &mut rng);
+                                }
+                            },
+                            "Metal Vein" => match grass_mode {
+                                0 => {
+                                    if rng(2) == 0 {
+                                        let n = 1 + rng(3);
+                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
+                                }
+                                1 => {
+                                    if rng(8) == 0 {
+                                        let n = 1 + rng(2);
+                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
+                                }
+                                _ => {
+                                    if rng(4) == 0 {
+                                        let n = 1 + rng(2);
+                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
+                                }
+                            },
+                            "Large Metal Vein" => match grass_mode {
+                                0 => {
+                                    let n = 1 + rng(3);
                                     place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
                                 }
-                            }
-                            "Large Metal Vein" => {
-                                if rng(2) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                1 => {
+                                    if rng(4) == 0 {
+                                        let n = 1 + rng(2);
+                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
                                 }
-                            }
-                            "Stone Vein" => {
-                                if rng(8) == 0 {
-                                    place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                _ => {
+                                    if rng(2) == 0 {
+                                        let n = 1 + rng(2);
+                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
                                 }
-                            }
-                            "Large Stone Vein" => {
-                                if rng(4) == 0 {
-                                    place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                            },
+                            "Stone Vein" => match grass_mode {
+                                0 => {
+                                    if rng(4) == 0 {
+                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
                                 }
-                            }
+                                1 => {} // tree-heavy: stone veins don't cluster
+                                _ => {
+                                    if rng(8) == 0 {
+                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
+                                }
+                            },
+                            "Large Stone Vein" => match grass_mode {
+                                0 => {
+                                    if rng(2) == 0 {
+                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
+                                }
+                                1 => {}
+                                _ => {
+                                    if rng(4) == 0 {
+                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    }
+                                }
+                            },
                             "Cotton Plant" => {
                                 if rng(4) == 0 {
                                     let n = 2 + rng(4);
-                                    place_cluster("Cotton Plant", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
+                                    place_cluster("Cotton Plant", 1, n, tx as u8, tz as u8, 1, &mut occupied, &mut elements, &mut rng);
                                 }
                             }
                             _ => {}
@@ -899,10 +999,21 @@ impl WorldGenerator {
             }
         }
 
-        // Sakura: very rarely place a Spirit Branch near any Spirit Tree that spawned.
+        // Grass: guarantee at least one Mossy Tree so the biome never looks bare.
+        if biome as u8 == BIOME_GRASS && !has_mossy_tree {
+            place_cluster("Mossy Tree", 2, 1, 4, 4, 4, &mut occupied, &mut elements, &mut rng);
+        }
+
+        // Beach: always place one Spawner - Coconuts per OceanShallow chunk.
+        // Since beach = 1-2 chunks, this yields ~1-2 coconut spawners per beach.
+        if biome as u8 == BIOME_OCEAN_SHALLOW {
+            place_cluster("Spawner - Coconuts", 1, 1, 5, 5, 5, &mut occupied, &mut elements, &mut rng);
+        }
+
+        // Sakura: place a Spirit Branch near any Spirit Tree that spawned (50% chance).
         if biome as u8 == BIOME_SAKURA {
             if let Some((stx, stz)) = spirit_tree_pos {
-                if rng(5) == 0 {
+                if rng(2) == 0 {
                     place_cluster("Spawner - Spirit Branch", 1, 1, stx, stz, 3, &mut occupied, &mut elements, &mut rng);
                 }
             }
