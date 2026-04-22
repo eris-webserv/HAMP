@@ -238,43 +238,59 @@ fn run_session(
 ) -> std::io::Result<()> {
     // ── Auth (synchronous, before splitting the stream) ───────────────────
     let mut s = stream;
-    s.write_all(&[0x01])?;
-    write_str(&mut s, &p.secret)?;
-    s.flush()?;
+    let auth_result = (|| -> std::io::Result<()> {
+        s.write_all(&[0x01])?;
+        write_str(&mut s, &p.secret)?;
+        s.flush()?;
 
-    match read_u8(&mut s) {
-        Some(0x01) => println!("[REGISTRY] Authenticated"),
-        Some(0x00) | None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "registry auth rejected",
-            ));
+        match read_u8(&mut s) {
+            Some(0x01) => println!("[REGISTRY] Authenticated"),
+            Some(0x00) | None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "registry auth rejected",
+                ));
+            }
+            Some(b) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unexpected auth response 0x{b:02X}"),
+                ));
+            }
         }
-        Some(b) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unexpected auth response 0x{b:02X}"),
-            ));
-        }
+
+        // ── Register ──────────────────────────────────────────────────────
+        s.write_all(&[0x02])?;
+        write_str(&mut s, &p.server_name)?;
+        write_str(&mut s, &p.server_desc)?;
+        write_str(&mut s, &p.server_desc2)?;
+        write_str(&mut s, &p.server_desc3)?;
+        write_str(&mut s, &p.server_desc4)?;
+        s.write_all(&p.max_players.to_le_bytes())?;
+        write_str(&mut s, &p.game_mode)?;
+        write_str(&mut s, &p.public_ip)?;
+        s.write_all(&p.game_port.to_le_bytes())?;
+        write_str(&mut s, &p.room_token)?;
+        s.flush()?;
+        println!("[REGISTRY] Registered as '{}'", p.server_name);
+        Ok(())
+    })();
+
+    if let Err(e) = auth_result {
+        // Writer thread was never spawned — return write_rx directly so the
+        // reconnect loop doesn't get stuck with an empty slot.
+        let _ = rx_return_tx.send(write_rx);
+        return Err(e);
     }
 
-    // ── Register ──────────────────────────────────────────────────────────
-    s.write_all(&[0x02])?;
-    write_str(&mut s, &p.server_name)?;
-    write_str(&mut s, &p.server_desc)?;
-    write_str(&mut s, &p.server_desc2)?;
-    write_str(&mut s, &p.server_desc3)?;
-    write_str(&mut s, &p.server_desc4)?;
-    s.write_all(&p.max_players.to_le_bytes())?;
-    write_str(&mut s, &p.game_mode)?;
-    write_str(&mut s, &p.public_ip)?;
-    s.write_all(&p.game_port.to_le_bytes())?;
-    write_str(&mut s, &p.room_token)?;
-    s.flush()?;
-    println!("[REGISTRY] Registered as '{}'", p.server_name);
-
     // ── Split stream ──────────────────────────────────────────────────────
-    let read_half  = s.try_clone()?;
+    let read_half = match s.try_clone() {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = rx_return_tx.send(write_rx);
+            return Err(e);
+        }
+    };
     let write_half = s;
 
     // Signal writer exit → give back write_rx to reconnect loop.
