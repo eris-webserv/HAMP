@@ -354,6 +354,7 @@ pub fn load(path: &Path) -> io::Result<WorldState> {
     for (zone_name, zone_map) in &chunks {
         for ((cx, cz), chunk) in zone_map {
             for el in &chunk.elements {
+                super::generator::reserve_item_ids(&el.item_data);
                 if let Some((shack_id, item_id)) = parse_shack_info(&el.item_data) {
                     let shack_zone = format!("shack{}", shack_id);
                     let kind = special_generators::zone_kind_from_item_id(&item_id);

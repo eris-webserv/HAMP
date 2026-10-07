@@ -367,7 +367,7 @@ impl WorldState {
             .map(|name| (name.to_string(), ZoneEntry::plain()))
             .collect();
 
-        Self {
+        let state = Self {
             name: name.to_string(),
             default_zone,
             chunks: RwLock::new(chunks),
@@ -376,6 +376,26 @@ impl WorldState {
             zones: RwLock::new(zone_map),
             teleporters: RwLock::new(Vec::new()),
             generator,
+        };
+        for grid in state.chunks.read().unwrap().values() {
+            for chunk in grid.values() { state.register_generated_interiors(chunk); }
+        }
+        state
+    }
+
+    /// Generated cave entrances carry the same zone metadata as built entrances.
+    /// Their interior generation remains handled by the existing zone generators.
+    fn register_generated_interiors(&self, chunk: &Chunk) {
+        for element in &chunk.elements {
+            if let Some((id, item_id)) = super::parse_shack_info(&element.item_data) {
+                self.zones.write().unwrap().entry(format!("shack{}",id)).or_insert_with(|| {
+                    ZoneEntry::interior(InteriorData {
+                        item_bytes: element.item_data.clone(), rotation: element.rotation,
+                        cx: chunk.x, cz: chunk.z, tx: element.cell_x as i16, tz: element.cell_z as i16,
+                        outer_zone: chunk.zone.clone(), kind: special_generators::zone_kind_from_item_id(&item_id),
+                    })
+                });
+            }
         }
     }
 
@@ -453,6 +473,7 @@ impl WorldState {
             land_claims: HashMap::new(),
         };
         let wire = chunk.to_wire();
+        self.register_generated_interiors(&chunk);
         self.chunks.write().unwrap()
             .entry(zone.to_string())
             .or_default()
@@ -474,14 +495,16 @@ impl WorldState {
                     .entry((cx, cz)).or_insert_with(|| {
                         if worldgen {
                             let p = self.generator.chunk_params(zone, cx as i32, cz as i32);
-                            Chunk {
+                            let chunk = Chunk {
                                 x: cx, z: cz, zone: zone.to_string(),
                                 biome: p.biome, floor_rot: p.floor_rot,
                                 floor_tex: p.floor_tex, floor_model: 0,
                                 mob_a: p.mob_a, mob_b: p.mob_b,
                                 elements: p.elements.into_iter().map(placed_to_element).collect(),
                                 land_claims: HashMap::new(),
-                            }
+                            };
+                            self.register_generated_interiors(&chunk);
+                            chunk
                         } else {
                             Chunk::blank(cx, cz, zone)
                         }

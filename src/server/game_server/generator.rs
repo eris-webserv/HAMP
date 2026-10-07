@@ -1,413 +1,127 @@
-// generator.rs — deterministic world biome/object generator.
-//
-// Architecture
-// ────────────
-// The world is divided into 36×36-chunk sectors. Each sector has its own
-// independent BiomeMap — a 36×36 grid of biome IDs derived by:
-//
-//  1. Mapping the chunk's (x, z) within the sector to a blob ID via BLOB_MAP.
-//  2. Assigning each of the 36 blob IDs a biome type from a weighted pool
-//     (per-sector seeded RNG, deterministic).
-//  3. Post-processing: ocean blobs have a 13% chance to become OceanShallow (5);
-//     swamp blobs have a 50% chance to become SwampDark (7).
-//
-// RE source: ChunkControl$GenerateNewBiomeMap (0x9837f8),
-//            ChunkControl$GenBlobBiometype   (0x98339c),
-//            ChunkControl$GetBiomeMapCoordinates (0x983e20),
-//            BanditCampsControl$PopulateOverworldChunk (0x95dc7c).
-//
-// Object spawning
-// ───────────────
-// After biome assignment, generate_chunk_elements() places 3–8 natural objects
-// per chunk using a per-chunk seeded RNG and per-biome weighted spawn tables.
-// Objects are InventoryItem packets with a single `item_id` string property.
-// Multi-tile objects (size 2, 3, 5) are placed at their top-left tile; the
-// server tracks occupied tiles to prevent overlap.
-//
-// Biome IDs
-// ─────────
-//   0 = Grass        4 = Ocean          8 = Woodlands
-//   1 = Snow         5 = OceanShallow   9 = Sakura
-//   2 = Desert       6 = Swamp
-//   3 = Evergreen    7 = SwampDark
-//
-// Floor properties (per-chunk random, seeded by seed ^ chunk_x ^ chunk_z):
-//   floor_rotation ∈ [0, 3]
-//   floor_texture  ∈ [0, BIOME_TEXTURE_COUNTS[biome] - 1]
-//
-// BLOB_MAP
-// ────────
-// Extracted from assets/biome-map.png (36×36 px).
-// Each unique colour in the PNG, encountered in scan order, gets the next
-// sequential blob ID (0–35). The resulting 36×36 array maps
-// (local_z_in_sector, local_x_in_sector) → blob_id.
+// Deterministic overworld generation using the client's biome and object rules.
+// Seed derivation, configured start-area overrides and chunk persistence remain
+// server-owned. The data and placement rules mirror ChunkControl,
+// ChunkGeneratorOverworld, ConstructionControl and MobControl.
+use crate::defs::packet::pack_string;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
-// ── Biome IDs ─────────────────────────────────────────────────────────────
+#[path = "overworld_data.rs"]
+mod data;
+use data::{BIOMES, BLOB_MAP, PAINTS};
 
-pub const BIOME_GRASS:          u8 = 0;
-pub const BIOME_SNOW:           u8 = 1;
-pub const BIOME_DESERT:         u8 = 2;
-pub const BIOME_EVERGREEN:      u8 = 3;
-pub const BIOME_OCEAN:          u8 = 4;
-pub const BIOME_OCEAN_SHALLOW:  u8 = 5;
-pub const BIOME_SWAMP:          u8 = 6;
-pub const BIOME_SWAMP_DARK:     u8 = 7;
-pub const BIOME_WOODLANDS:      u8 = 8;
-pub const BIOME_SAKURA:         u8 = 9;
+#[derive(Clone, Copy)]
+struct ObjectDefinition {
+    name: &'static str,
+    is_item: bool,
+    rarity: u8,
+    clump: (usize, usize),
+    clump_overwrite: &'static str,
+    dont_rotate: bool,
+    min_depth: f32,
+}
 
-/// Number of floor textures available per biome.
-/// Exact counts are Unity-serialized and not accessible from the binary;
-/// these are conservative defaults (4 for most, 2 for rarer biomes).
-/// Adjust after in-game testing if textures wrap or show incorrect tiles.
-pub const BIOME_TEXTURE_COUNTS: [u8; 10] = [
-    4, // Grass
-    3, // Snow
-    3, // Desert
-    3, // Evergreen
-    2, // Ocean
-    2, // OceanShallow
-    2, // Swamp
-    2, // SwampDark
-    3, // Woodlands
-    3, // Sakura
-];
+struct BiomeDefinition {
+    min_depth: f32,
+    texture_count: usize,
+    scenic_budget: (usize, usize),
+    item_budget: (usize, usize),
+    dont_spawn_greens: bool,
+    copy_mobs_from: i8,
+    mobs: &'static [&'static str],
+    objects: &'static [ObjectDefinition],
+}
 
-/// Mob pair strings for each biome (mobA, mobB).
-/// These are used by client-side `ChunkControl` to spawn ambient mobs.
-/// Empty strings = no mobs.
-pub const BIOME_MOBS: [(&str, &str); 10] = [
-    ("",  ""),  // Grass
-    ("",  ""),  // Snow
-    ("",  ""),  // Desert
-    ("",  ""),  // Evergreen
-    ("",  ""),  // Ocean
-    ("",  ""),  // OceanShallow
-    ("",  ""),  // Swamp
-    ("",  ""),  // SwampDark
-    ("",  ""),  // Woodlands
-    ("",  ""),  // Sakura
-];
-
-// ── Placed object (chunk element) ────────────────────────────────────────
-
-/// A single object to be placed in a chunk cell.
-/// `item_data` is the full InventoryItem wire encoding (see `pack_item`).
 pub struct PlacedObject {
-    pub cell_x:    u8,
-    pub cell_z:    u8,
-    pub rotation:  u8,
+    pub cell_x: u8,
+    pub cell_z: u8,
+    pub rotation: u8,
     pub item_data: Vec<u8>,
 }
 
-// ── Object spawn tables ───────────────────────────────────────────────────
-//
-// (item_name, weight, tile_size)
-//   Common:      weight 20
-//   Rare:        weight  5
-//   Really rare: weight  2
-//   Super rare:  weight  1
-//
-// OceanShallow (5) and SwampDark (7) have dedicated tables.
-
-static OBJECTS_GRASS: &[(&str, u32, u8)] = &[
-    // Common
-    ("Metal Vein",            12, 2), ("Green Blob",            20, 1),
-    ("Spawner - Sticks",      20, 1), ("Stone Vein",            12, 2),
-    // Rare
-    ("Cotton Plant",           2, 1), ("Large Stone Vein",       3, 2),
-    ("Large Metal Vein",       3, 2), ("Spawner - Nuts",         5, 1),
-    ("Red Blob",               5, 1), ("Pond",                   5, 3),
-    ("Mossy Tree",             5, 2), ("Ancient Pillars",        5, 2),
-    // Really rare
-    ("Large Emerald Vein",     1, 2), ("Emerald Vein",           1, 2),
-    ("Blue Blob",              2, 1), ("Beehive",                2, 1),
-];
-
-static OBJECTS_SNOW: &[(&str, u32, u8)] = &[
-    // Common
-    ("Green Blob",            20, 1), ("Stone Vein (Snowy)",    12, 2),
-    // Rare
-    ("Red Blob",               5, 1), ("Frozen Pond",            5, 3),
-    ("Snowman",                5, 1), ("Frozen Tree",            5, 2),
-    ("Titanium Vein",          3, 2),
-    // Really rare
-    ("Blue Blob",              2, 1), ("MoonBerry Bush",         2, 1),
-    // Super rare
-    ("Spawner - Snowballs",    1, 1),
-];
-
-static OBJECTS_DESERT: &[(&str, u32, u8)] = &[
-    // Common (blobs deliberately less common)
-    ("Stone Vein (Desert)",   12, 2), ("Cactus",                20, 1),
-    ("Green Blob",             8, 1),
-    // Rare
-    ("Uranium Vein",           3, 2), ("Gold Vein",              3, 2),
-    ("Red Blob",               3, 1),
-    // Really rare
-    ("Blue Blob",              2, 1), ("Spawner - Sticks",       2, 1),
-];
-
-static OBJECTS_EVERGREEN: &[(&str, u32, u8)] = &[
-    // Common
-    ("Evergreen Tree",        20, 2), ("Tar Pit",                4, 2),
-    ("Dug-up Brown Mushroom", 20, 1), ("Salmonberry Bush",      20, 1),
-    ("Stone Vein",            12, 2), ("Spawner - Sticks",      20, 1),
-    ("Green Blob",            20, 1),
-    // Rare
-    ("Large Stone Vein",       3, 2), ("Dug-Up Red Mushroom",   5, 1),
-    ("Gold Vein",              3, 2),
-    // Really rare
-    ("Blue Blob",              2, 1), ("Metal Vein",             2, 2),
-    ("Giant Red Mushroom",     2, 1),
-    // Super rare
-    ("Large Ruby Vein",        1, 2), ("Ruby Vein",              1, 2),
-];
-
-// Spirit Tree is here; Spirit Branch is placed as a cluster off Spirit Tree.
-static OBJECTS_SAKURA: &[(&str, u32, u8)] = &[
-    // Common
-    ("Green Blob",            20, 1), ("Stone Vein (Sakura)",   12, 2),
-    ("Sakura Tree",           20, 2),
-    // Rare
-    ("Red Blob",               5, 1), ("Flowers",                5, 1),
-    ("Sakura Pond",            5, 3), ("Stone Lantern",          5, 1),
-    // Really rare
-    ("Amethyst Vein",          2, 2), ("Lavender Bush",          2, 1),
-    ("Blue Blob",              2, 1), ("Spawner - Sticks",       2, 1),
-    ("Titanium Vein (Sakura)", 2, 2),
-    // Super rare
-    ("Spirit Tree",            1, 3),
-];
-
-// Ocean: deep water, stone veins only. Shells spawn on the beach (OceanShallow).
-static OBJECTS_OCEAN: &[(&str, u32, u8)] = &[
-    ("Stone Vein (Ocean)", 1, 2),
-];
-
-// OceanShallow = beach: Palm Trees with shells washed ashore.
-// Coconut spawners (1 per beach chunk) are placed unconditionally after the main loop.
-static OBJECTS_OCEAN_SHALLOW: &[(&str, u32, u8)] = &[
-    ("Palm Tree",              10, 2),
-    ("Spawner - Blue Shells",   2, 1), ("Spawner - White Shells",  2, 1),
-    ("Spawner - Green Shells",  2, 1), ("Spawner - Purple Shells", 2, 1),
-    ("Spawner - Black Shells",  2, 1), ("Spawner - Red Shells",    2, 1),
-    ("Spawner - Gold Shells",   2, 1),
-];
-
-// Swamp: more spaced out than other biomes; cluster logic uses small
-// cluster counts (1–2) and rarely places a large-vein variant.
-static OBJECTS_SWAMP: &[(&str, u32, u8)] = &[
-    // Common
-    ("Willow Tree",           20, 2), ("Green Blob",            20, 1),
-    ("Dug-up Brown Mushroom", 20, 1), ("Stone Vein",            20, 2),
-    ("Rotting Stump",         20, 1),
-    // Rare
-    ("Giant Purple Mushroom",  5, 1), ("Red Blob",               5, 1),
-    ("Metal Vein",             5, 2), ("Large Metal Vein",       5, 2),
-    // Really rare
-    ("Blue Blob",              2, 1),
-];
-
-// SwampDark = swamp lake: only a very rare Stone Vein (70% chance of nothing).
-static OBJECTS_SWAMP_DARK: &[(&str, u32, u8)] = &[
-    ("Stone Vein",             1, 2),
-];
-
-// Woodlands: wheat/mushroom clusters are the signature; pumpkins and giant
-// pumpkins are lone finds. Veins cluster, with the large variant being the
-// rarer seed of a cluster.
-static OBJECTS_WOODLANDS: &[(&str, u32, u8)] = &[
-    // Common
-    ("Birch Tree (Variant 1)",20, 2), ("Birch Tree (Variant 2)",20, 2),
-    ("Dug-Up Wheat",          20, 1), ("Green Blob",            20, 1),
-    // Rare
-    ("Blue Blob",              5, 1), ("Red Blob",               5, 1),
-    ("Metal Vein",             5, 2), ("Large Metal Vein",       5, 2),
-    ("Stone Vein (White)",     5, 2),
-    // Super rare
-    ("Silver Vein",            2, 2), ("Dug-up Brown Mushroom",  2, 1),
-    ("Dug-up Pumpkin",         2, 1),
-    // Really really rare
-    ("Spawner - Nuts",         1, 1), ("Dug-Up Giant Pumpkin",   1, 2),
-];
-
-fn biome_object_table(biome: i16) -> &'static [(&'static str, u32, u8)] {
-    match biome as u8 {
-        BIOME_GRASS         => OBJECTS_GRASS,
-        BIOME_SNOW          => OBJECTS_SNOW,
-        BIOME_DESERT        => OBJECTS_DESERT,
-        BIOME_EVERGREEN     => OBJECTS_EVERGREEN,
-        BIOME_OCEAN         => OBJECTS_OCEAN,
-        BIOME_OCEAN_SHALLOW => OBJECTS_OCEAN_SHALLOW,
-        BIOME_SWAMP         => OBJECTS_SWAMP,
-        BIOME_SWAMP_DARK    => OBJECTS_SWAMP_DARK,
-        BIOME_WOODLANDS     => OBJECTS_WOODLANDS,
-        BIOME_SAKURA        => OBJECTS_SAKURA,
-        _                   => OBJECTS_GRASS,
-    }
-}
-
-/// Encodes an item name into the InventoryItem wire format.
-/// Format: u16(0 shorts) | u16(1 string) | str("item_id") | str(name) | u16(0 ints)
+/// InventoryItem encoding: short properties, string properties, long properties.
 pub fn pack_item(name: &str) -> Vec<u8> {
-    let mut p = Vec::new();
-    p.extend_from_slice(&0u16.to_le_bytes()); // 0 short props
-    p.extend_from_slice(&1u16.to_le_bytes()); // 1 string prop
-    p.extend(pack_string("item_id"));
-    p.extend(pack_string(name));
-    p.extend_from_slice(&0u16.to_le_bytes()); // 0 int props
-    p
+    pack_item_data(name, &[], &[], &[])
 }
 
-// ── Blob map ──────────────────────────────────────────────────────────────
-//
-// BLOB_MAP[z][x] = blob_id for local coords within a 36×36 sector.
-// Extracted from assets/biome-map.png (scan-order colour assignment).
+fn pack_item_data(
+    name: &str,
+    shorts: &[(&str, i16)],
+    strings: &[(&str, &str)],
+    longs: &[(&str, i32)],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(shorts.len() as u16).to_le_bytes());
+    for (key, value) in shorts {
+        out.extend(pack_string(key));
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&((strings.len() + 1) as u16).to_le_bytes());
+    out.extend(pack_string("item_id"));
+    out.extend(pack_string(name));
+    for (key, value) in strings {
+        out.extend(pack_string(key));
+        out.extend(pack_string(value));
+    }
+    out.extend_from_slice(&(longs.len() as u16).to_le_bytes());
+    for (key, value) in longs {
+        out.extend(pack_string(key));
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
 
-pub const BLOB_MAP: [[u8; 36]; 36] = [
-    [ 0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5],
-    [ 0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5],
-    [ 0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5],
-    [ 0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5,  5],
-    [ 0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5,  5],
-    [ 0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  2,  2,  2,  2,  6,  6,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  7,  7,  5,  5,  5,  5,  5,  5],
-    [ 8,  8,  0,  0,  0,  0,  0,  1,  1,  1,  9,  9,  2,  2,  2,  6,  6,  6,  3,  3, 10, 10, 10, 10,  4,  4,  7,  7,  7,  7, 11, 11,  5,  5,  5,  5],
-    [ 8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  6,  6,  6,  6,  6,  6, 10, 10, 10, 10, 10, 10,  7,  7,  7,  7,  7,  7, 11, 11, 11, 11, 11, 11],
-    [ 8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  6,  6,  6,  6,  6,  6, 10, 10, 10, 10, 10, 10,  7,  7,  7,  7,  7,  7, 11, 11, 11, 11, 11, 11],
-    [ 8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  6,  6,  6,  6,  6,  6, 10, 10, 10, 10, 10, 10,  7,  7,  7,  7,  7,  7, 11, 11, 11, 11, 11, 11],
-    [ 8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,  6,  6,  6,  6,  6,  6, 10, 10, 10, 10, 10, 10,  7,  7,  7,  7,  7,  7, 11, 11, 11, 11, 11, 11],
-    [ 8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9, 12,  6,  6,  6,  6,  6, 13, 10, 10, 10, 10, 10, 14,  7,  7,  7,  7,  7, 15, 11, 11, 11, 11, 11, 16],
-    [17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 12, 12, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16],
-    [17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 12, 12, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16],
-    [17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 12, 12, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16],
-    [17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 12, 12, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 16],
-    [17, 17, 17, 18, 18, 18, 18, 18, 18, 12, 12, 12, 13, 13, 13, 13, 13, 19, 14, 14, 14, 14, 14, 20, 15, 15, 15, 15, 15, 21, 16, 16, 16, 16, 16, 22],
-    [17, 17, 23, 23, 23, 23, 18, 18, 12, 12, 12, 12, 19, 19, 19, 13, 13, 19, 20, 20, 20, 14, 14, 20, 21, 21, 21, 15, 15, 21, 22, 22, 22, 16, 16, 22],
-    [23, 23, 23, 23, 23, 23, 23, 12, 12, 12, 12, 12, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22],
-    [23, 23, 23, 23, 23, 23, 23, 12, 12, 12, 12, 12, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22],
-    [23, 23, 23, 23, 23, 23, 23, 12, 12, 12, 12, 12, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22],
-    [23, 23, 23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 19, 19, 19, 19, 19, 25, 20, 20, 20, 20, 20, 26, 21, 21, 21, 21, 21, 27, 22, 22, 22, 22, 22, 28],
-    [23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28],
-    [23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28],
-    [23, 23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28],
-    [23, 23, 23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 26, 26, 26, 26, 26, 26, 27, 27, 27, 27, 27, 27, 28, 28, 28, 28, 28, 28],
-    [29, 29, 29, 29, 24, 24, 24, 24, 24, 24, 24, 29, 25, 25, 25, 25, 25, 29, 26, 26, 26, 26, 26, 29, 27, 27, 27, 27, 27, 29, 28, 28, 28, 28, 28, 29],
-    [29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29],
-    [29, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
-    [30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30],
-    [30, 30, 30, 30, 30, 31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 33, 33, 33, 30, 30, 30, 30, 30, 35, 35, 35, 35, 35, 35],
-    [31, 31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 34, 34, 34, 34, 34, 34, 34, 34, 34, 35, 35, 35, 35, 35, 35, 35],
-    [31, 31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 34, 34, 34, 34, 34, 34, 34, 34, 34, 35, 35, 35, 35, 35, 35, 35],
-    [31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 35, 35, 35, 35, 35, 35, 35],
-    [31, 31, 31, 31, 31, 31, 31, 32, 32, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 34, 34, 34, 34, 34, 34, 34, 34, 34, 34, 35, 35, 35, 35, 35, 35, 35],
-    [31, 31, 31, 31, 31, 32, 32, 32, 32, 32, 32, 32, 33, 33, 33, 33, 34, 34, 34, 34, 34, 34, 34, 34, 34, 30, 30, 30, 30, 30, 35, 35, 35, 35, 35, 35],
-];
-
-// ── BiomeWeights ──────────────────────────────────────────────────────────
-//
-// Relative biome commonness. Values are ratios (e.g. 1.00, 0.50) and are
-// normalized against their sum to fill the 36-blob pool that covers a
-// sector. Zero-weighted biomes never appear.
-//
-// RE: `GameController$ParseBiomeCommonness` in HybridsPublicServer
-// uses the same notion of per-biome ratios read from `config_vals`.
-// The original scaled percentages 0-100 to the client; our generator
-// consumes them directly as ratios.
-//
-// Defaults mirror the original's 8-biome call pattern
-//   (2, 1, 1, 1, 2, 1, 1, 1) expressed as fractions of the grass weight.
+pub const BIOME_GRASS: u8 = 0;
+pub const BIOME_SNOW: u8 = 1;
+pub const BIOME_DESERT: u8 = 2;
+pub const BIOME_EVERGREEN: u8 = 3;
+pub const BIOME_OCEAN: u8 = 4;
+pub const BIOME_OCEAN_SHALLOW: u8 = 5;
+pub const BIOME_SWAMP: u8 = 6;
+pub const BIOME_SWAMP_DARK: u8 = 7;
+pub const BIOME_WOODLANDS: u8 = 8;
+pub const BIOME_SAKURA: u8 = 9;
 
 #[derive(Clone, Debug)]
 pub struct BiomeWeights {
-    pub grass:     f32,
-    pub snow:      f32,
-    pub desert:    f32,
+    pub grass: f32,
+    pub snow: f32,
+    pub desert: f32,
     pub evergreen: f32,
-    pub ocean:     f32,
-    pub swamp:     f32,
+    pub ocean: f32,
+    pub swamp: f32,
     pub woodlands: f32,
-    pub sakura:    f32,
+    pub sakura: f32,
 }
 
 impl Default for BiomeWeights {
     fn default() -> Self {
         Self {
-            grass:     1.00,
-            snow:      0.50,
-            desert:    0.50,
+            grass: 1.00,
+            snow: 0.50,
+            desert: 0.50,
             evergreen: 0.50,
-            ocean:     1.00,
-            swamp:     0.50,
+            ocean: 1.00,
+            swamp: 0.50,
             woodlands: 0.50,
-            sakura:    0.50,
+            sakura: 0.50,
         }
     }
 }
-
-impl BiomeWeights {
-    /// Expands the weights into an ordered 36-entry biome pool.
-    ///
-    /// Uses largest-remainder rounding so the counts sum to exactly 36
-    /// regardless of the input weights. If every weight is <= 0 the pool
-    /// falls back to all-grass.
-    fn to_pool(&self) -> Vec<u8> {
-        const TOTAL: usize = 36;
-        let entries: [(u8, f32); 8] = [
-            (BIOME_GRASS,     self.grass.max(0.0)),
-            (BIOME_SNOW,      self.snow.max(0.0)),
-            (BIOME_DESERT,    self.desert.max(0.0)),
-            (BIOME_EVERGREEN, self.evergreen.max(0.0)),
-            (BIOME_OCEAN,     self.ocean.max(0.0)),
-            (BIOME_SWAMP,     self.swamp.max(0.0)),
-            (BIOME_WOODLANDS, self.woodlands.max(0.0)),
-            (BIOME_SAKURA,    self.sakura.max(0.0)),
-        ];
-        let sum: f32 = entries.iter().map(|e| e.1).sum();
-        if sum <= 0.0 {
-            return vec![BIOME_GRASS; TOTAL];
-        }
-
-        // Floor counts + remainders for largest-remainder apportionment.
-        let mut counts = [0usize; 8];
-        let mut rems   = [(0usize, 0.0_f32); 8];
-        let mut assigned = 0usize;
-        for (i, (_, w)) in entries.iter().enumerate() {
-            let raw = *w / sum * TOTAL as f32;
-            let floor = raw.floor() as usize;
-            counts[i] = floor;
-            rems[i]   = (i, raw - raw.floor());
-            assigned += floor;
-        }
-        // Distribute remaining slots to the biggest remainders.
-        rems.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut k = 0;
-        while assigned < TOTAL {
-            counts[rems[k % 8].0] += 1;
-            assigned += 1;
-            k += 1;
-        }
-
-        let mut pool = Vec::with_capacity(TOTAL);
-        for (i, (biome, _)) in entries.iter().enumerate() {
-            for _ in 0..counts[i] { pool.push(*biome); }
-        }
-        pool.truncate(TOTAL);
-        pool
-    }
-}
-
-// ── ZoneConfig ────────────────────────────────────────────────────────────
 
 /// Per-zone biome configuration.
 #[derive(Clone, Debug)]
 pub struct ZoneConfig {
-    pub name:    String,
+    pub name: String,
     pub weights: BiomeWeights,
 }
 
 impl ZoneConfig {
     pub fn new(name: impl Into<String>, weights: BiomeWeights) -> Self {
-        Self { name: name.into(), weights }
+        Self {
+            name: name.into(),
+            weights,
+        }
     }
 
     pub fn default_main() -> Self {
@@ -425,18 +139,18 @@ impl ZoneConfig {
 /// the override.
 #[derive(Clone, Debug)]
 pub struct WorldTemplate {
-    pub seed:  u64,
+    pub seed: u64,
     pub zones: Vec<ZoneConfig>,
-    pub start_biome:        i16,
+    pub start_biome: i16,
     pub start_biome_radius: i16,
 }
 
 impl Default for WorldTemplate {
     fn default() -> Self {
         Self {
-            seed:  0,
+            seed: 0,
             zones: vec![ZoneConfig::default_main()],
-            start_biome:        BIOME_GRASS as i16,
+            start_biome: BIOME_GRASS as i16,
             start_biome_radius: 3,
         }
     }
@@ -444,7 +158,12 @@ impl Default for WorldTemplate {
 
 impl WorldTemplate {
     pub fn new(seed: u64, zones: Vec<ZoneConfig>) -> Self {
-        Self { seed, zones, start_biome: BIOME_GRASS as i16, start_biome_radius: 3 }
+        Self {
+            seed,
+            zones,
+            start_biome: BIOME_GRASS as i16,
+            start_biome_radius: 3,
+        }
     }
 
     fn zone_weights(&self, zone_name: &str) -> &BiomeWeights {
@@ -460,12 +179,12 @@ impl WorldTemplate {
 
 /// Output of the generator for a single chunk.
 pub struct ChunkBiomeParams {
-    pub biome:     i16,
+    pub biome: i16,
     pub floor_rot: i16,
     pub floor_tex: i16,
-    pub mob_a:     String,
-    pub mob_b:     String,
-    pub elements:  Vec<PlacedObject>,
+    pub mob_a: String,
+    pub mob_b: String,
+    pub elements: Vec<PlacedObject>,
 }
 
 // ── Deterministic RNG ─────────────────────────────────────────────────────
@@ -486,18 +205,124 @@ fn rng_u32(seed: u64, salt: u64) -> u32 {
 
 // ── WorldGenerator ────────────────────────────────────────────────────────
 
-use crate::defs::packet::pack_string;
-use std::collections::HashMap;
-use std::sync::RwLock;
+/// SplitMix remains the server's source of deterministic random values.
+struct Rng {
+    seed: u64,
+    counter: u64,
+}
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self { seed, counter: 0 }
+    }
+    fn raw(&mut self) -> u32 {
+        self.counter += 1;
+        rng_u32(self.seed, self.counter)
+    }
+    fn range(&mut self, min: usize, max: usize) -> usize {
+        let draw = self.raw();
+        if max <= min {
+            min
+        } else {
+            min + draw as usize % (max - min)
+        }
+    }
+    fn value(&mut self) -> f32 {
+        (self.raw() >> 8) as f32 / 16_777_215.0
+    }
+    fn float_range(&mut self, min: f32, max: f32) -> f32 {
+        min + (max - min) * self.value()
+    }
+}
 
-/// Generates and caches sector BiomeMaps for a world.
-///
-/// Each sector (sector_x, sector_z) independently assigns biome types to the
-/// 36 blob IDs using the zone's BiomeWeights and a seeded shuffle.
+struct SectorMap {
+    biomes: [[u8; 36]; 36],
+    mobs: [(&'static str, &'static str); 36],
+}
+
 pub struct WorldGenerator {
     template: WorldTemplate,
-    /// Cache: (zone_name, sector_x, sector_z) → [biome_id; 36]
-    sector_cache: RwLock<HashMap<(String, i32, i32), [u8; 36]>>,
+    sector_cache: RwLock<HashMap<(String, i32, i32), Arc<SectorMap>>>,
+}
+
+impl BiomeWeights {
+    fn eligible(&self, depth: f32) -> Vec<(u8, f32)> {
+        [
+            (BIOME_GRASS, self.grass),
+            (BIOME_SNOW, self.snow),
+            (BIOME_DESERT, self.desert),
+            (BIOME_EVERGREEN, self.evergreen),
+            (BIOME_OCEAN, self.ocean),
+            (BIOME_SWAMP, self.swamp),
+            (BIOME_WOODLANDS, self.woodlands),
+            (BIOME_SAKURA, self.sakura),
+        ]
+        .into_iter()
+        .filter(|(id, weight)| {
+            weight.is_finite() && *weight > 0.0 && BIOMES[*id as usize].min_depth <= depth
+        })
+        .collect()
+    }
+
+    fn choose(&self, depth: f32, rng: &mut Rng) -> u8 {
+        let entries = self.eligible(depth);
+        // The default configuration expands to the client's pool [0,0,1,2,3,4,4,6,8,9].
+        // Preserve arbitrary fractional weights exposed by server configuration.
+        if entries.is_empty() {
+            return BIOME_GRASS;
+        }
+        if entries
+            .iter()
+            .all(|(_, w)| *w * 2.0 == (*w * 2.0).floor() && *w <= 10000.0)
+        {
+            let total: usize = entries.iter().map(|(_, w)| (*w * 2.0) as usize).sum();
+            let mut index = rng.range(0, total);
+            for (id, weight) in &entries {
+                let count = (*weight * 2.0) as usize;
+                if index < count {
+                    return *id;
+                }
+                index -= count;
+            }
+        } else {
+            let total: f32 = entries.iter().map(|(_, w)| w).sum();
+            let mut draw = rng.value() * total;
+            for (id, weight) in &entries {
+                if draw < *weight {
+                    return *id;
+                }
+                draw -= weight;
+            }
+        }
+        entries.last().unwrap().0
+    }
+}
+
+fn mob_pair(biome: u8, rng: &mut Rng) -> (&'static str, &'static str) {
+    let mut definition = &BIOMES[biome as usize];
+    if definition.copy_mobs_from >= 0 {
+        definition = &BIOMES[definition.copy_mobs_from as usize];
+    }
+    if definition.mobs.is_empty() {
+        return ("crab", "crab");
+    }
+    (
+        definition.mobs[rng.range(0, definition.mobs.len())],
+        definition.mobs[rng.range(0, definition.mobs.len())],
+    )
+}
+
+fn distance(x: f32, y: f32, z: f32) -> f32 {
+    (x * x + y * y + z * z).sqrt()
+}
+
+fn chunk_depth(x: i32, z: i32) -> f32 {
+    // GameController.DepthAt measures from campos_result after the breeding
+    // elevator reaches its gameplay position, including its vertical offset.
+    distance(
+        x as f32 * 10.0 + 5.0 - (-7.6617),
+        -0.762,
+        z as f32 * 10.0 + 5.0 - 6.4955,
+    )
 }
 
 impl WorldGenerator {
@@ -507,560 +332,443 @@ impl WorldGenerator {
             sector_cache: RwLock::new(HashMap::new()),
         }
     }
-
-    /// Returns an iterator over the zone names defined in the template.
     pub fn template_zones(&self) -> impl Iterator<Item = &str> {
         self.template.zones.iter().map(|z| z.name.as_str())
     }
-
     pub fn template(&self) -> &WorldTemplate {
         &self.template
     }
-
-    /// Returns the chunk's sector coordinates.
-    /// sector = (floor(chunk_x / 36), floor(chunk_z / 36))
-    fn sector_of(chunk_x: i32, chunk_z: i32) -> (i32, i32) {
-        let sx = chunk_x.div_euclid(36);
-        let sz = chunk_z.div_euclid(36);
-        (sx, sz)
+    fn sector_of(x: i32, z: i32) -> (i32, i32) {
+        (x.div_euclid(36), z.div_euclid(36))
+    }
+    fn local_in_sector(x: i32, z: i32) -> (usize, usize) {
+        (x.rem_euclid(36) as usize, z.rem_euclid(36) as usize)
     }
 
-    /// Local position within a sector (0–35 each).
-    fn local_in_sector(chunk_x: i32, chunk_z: i32) -> (usize, usize) {
-        let lx = chunk_x.rem_euclid(36) as usize;
-        let lz = chunk_z.rem_euclid(36) as usize;
-        (lx, lz)
+    fn sector_biomes(&self, zone: &str, x: i32, z: i32) -> Arc<SectorMap> {
+        let key = (zone.to_string(), x, z);
+        if let Some(map) = self.sector_cache.read().unwrap().get(&key) {
+            return Arc::clone(map);
+        }
+        let map = Arc::new(self.generate_sector(zone, x, z));
+        Arc::clone(self.sector_cache.write().unwrap().entry(key).or_insert(map))
     }
 
-    /// Returns or generates the blob→biome mapping for a sector.
-    fn sector_biomes(&self, zone_name: &str, sector_x: i32, sector_z: i32) -> [u8; 36] {
-        let key = (zone_name.to_string(), sector_x, sector_z);
-        {
-            let cache = self.sector_cache.read().unwrap();
-            if let Some(map) = cache.get(&key) {
-                return *map;
+    fn generate_sector(&self, zone: &str, sx: i32, sz: i32) -> SectorMap {
+        let sector_salt = (sx as u64)
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add((sz as u64).wrapping_mul(0x6c62272e07bb0142));
+        let mut rng = Rng::new(splitmix64(self.template.seed ^ sector_salt));
+        let mut depths = [f32::INFINITY; 36];
+        for x in 0..36 {
+            for z in 0..36 {
+                let depth = distance(
+                    ((sx * 36 + x as i32) * 10 + 5) as f32,
+                    0.0,
+                    ((sz * 36 + z as i32) * 10 + 5) as f32,
+                );
+                let blob = BLOB_MAP[x][z] as usize;
+                depths[blob] = depths[blob].min(depth);
             }
         }
-
-        let map = self.generate_sector(zone_name, sector_x, sector_z);
-        self.sector_cache.write().unwrap().insert(key, map);
+        let mut bases = [None; 36];
+        let mut map = SectorMap {
+            biomes: [[0; 36]; 36],
+            mobs: [("crab", "crab"); 36],
+        };
+        for x in 0..36 {
+            for z in 0..36 {
+                let blob = BLOB_MAP[x][z] as usize;
+                let base = *bases[blob].get_or_insert_with(|| {
+                    let biome = self
+                        .template
+                        .zone_weights(zone)
+                        .choose(depths[blob], &mut rng);
+                    map.mobs[blob] = mob_pair(biome, &mut rng);
+                    biome
+                });
+                map.biomes[x][z] = match base {
+                    BIOME_SWAMP if rng.value() < 0.5 => BIOME_SWAMP_DARK,
+                    BIOME_OCEAN if rng.value() < 0.13 => BIOME_OCEAN_SHALLOW,
+                    _ => base,
+                };
+            }
+        }
         map
     }
 
-    /// Generates a blob→biome assignment for one sector.
-    ///
-    /// RE: ChunkControl$GenerateNewBiomeMap (0x9837f8)
-    ///  1. Build a pool of biome type entries from weights.
-    ///  2. Fisher-Yates shuffle using seeded RNG.
-    ///  3. Assign pool[blob_id % pool.len()] to each blob.
-    ///  4. Post-process ocean→shallow (13%), swamp→dark (50%).
-    fn generate_sector(&self, zone_name: &str, sector_x: i32, sector_z: i32) -> [u8; 36] {
-        let weights = self.template.zone_weights(zone_name);
-        let mut pool = weights.to_pool();
-
-        // Sector seed: mix world seed with sector coords
-        let sector_salt = (sector_x as u64)
-            .wrapping_mul(0x517cc1b727220a95)
-            .wrapping_add((sector_z as u64).wrapping_mul(0x6c62272e07bb0142));
-        let base_seed = splitmix64(self.template.seed ^ sector_salt);
-
-        // Fisher-Yates shuffle of the pool
-        for i in (1..pool.len()).rev() {
-            let j = rng_u32(base_seed, i as u64) as usize % (i + 1);
-            pool.swap(i, j);
-        }
-
-        // Assign biomes to blobs
-        let mut blob_biomes = [BIOME_GRASS; 36];
-        for blob_id in 0..36usize {
-            blob_biomes[blob_id] = pool[blob_id];
-        }
-
-        // Post-processing — RE: ChunkControl$GenerateNewBiomeMap
-        //   swamp blobs: 50% chance → SwampDark
-        //   ocean→OceanShallow is handled per-chunk in chunk_params (thin 1-2 chunk beach strips).
-        for blob_id in 0..36usize {
-            let post_salt = (blob_id as u64).wrapping_add(0x8000_0000);
-            let roll = rng_u32(base_seed, post_salt) % 100;
-            match blob_biomes[blob_id] {
-                BIOME_SWAMP if roll < 50 => { blob_biomes[blob_id] = BIOME_SWAMP_DARK; }
-                _ => {}
-            }
-        }
-
-        blob_biomes
-    }
-
-    /// Returns biome parameters for a chunk at (chunk_x, chunk_z) in zone.
-    pub fn chunk_params(&self, zone_name: &str, chunk_x: i32, chunk_z: i32) -> ChunkBiomeParams {
-        let (sx, sz) = Self::sector_of(chunk_x, chunk_z);
-        let (lx, lz) = Self::local_in_sector(chunk_x, chunk_z);
-
-        let blob_biomes = self.sector_biomes(zone_name, sx, sz);
-        let blob_id     = BLOB_MAP[lz][lx] as usize;
-        let mut biome   = blob_biomes[blob_id] as i16;
-
-        // Start-area override: force spawn region to a fixed biome, matching
-        // the `"Biome at start area"` knob on the public server. Applies when
-        // the chunk is within `start_biome_radius` of (0,0) in both axes.
+    pub fn chunk_params(&self, zone: &str, x: i32, z: i32) -> ChunkBiomeParams {
+        let (sx, sz) = Self::sector_of(x, z);
+        let (lx, lz) = Self::local_in_sector(x, z);
+        let map = self.sector_biomes(zone, sx, sz);
+        let mut biome = map.biomes[lx][lz];
         let radius = self.template.start_biome_radius;
         if radius > 0
-            && chunk_x.abs() <= radius as i32
-            && chunk_z.abs() <= radius as i32
-            && self.template.start_biome >= 0
-            && (self.template.start_biome as usize) < BIOME_TEXTURE_COUNTS.len()
+            && x.abs() <= radius as i32
+            && z.abs() <= radius as i32
+            && (0..10).contains(&self.template.start_biome)
         {
-            biome = self.template.start_biome;
+            biome = self.template.start_biome as u8;
         }
-
-        // Beach: convert ~5% of ocean chunks to OceanShallow per-chunk so beaches appear as
-        // thin 1-2 chunk strips within ocean areas (always adjacent to ocean).
-        if biome as u8 == BIOME_OCEAN {
-            let beach_hash = splitmix64(
-                self.template.seed
-                    ^ (chunk_x as u64).wrapping_mul(0xd6e8feb86659fd93)
-                    ^ (chunk_z as u64).wrapping_mul(0xd2a98b26625eee7b),
-            );
-            if beach_hash % 100 < 5 {
-                biome = BIOME_OCEAN_SHALLOW as i16;
-            }
-        }
-
-        // Per-chunk floor properties: seeded by world seed ^ chunk coords
-        let chunk_salt = (chunk_x as u64)
+        let chunk_salt = (x as u64)
             .wrapping_mul(0x9e3779b97f4a7c15)
-            .wrapping_add((chunk_z as u64).wrapping_mul(0x6c62272e07bb0142));
+            .wrapping_add((z as u64).wrapping_mul(0x6c62272e07bb0142));
         let chunk_seed = splitmix64(self.template.seed ^ chunk_salt);
-
-        let tex_count = BIOME_TEXTURE_COUNTS[biome as usize] as u64;
-        let floor_tex = (rng_u32(chunk_seed, 0x01) as u64 % tex_count) as i16;
+        let floor_tex =
+            (rng_u32(chunk_seed, 0x01) as usize % BIOMES[biome as usize].texture_count) as i16;
         let floor_rot = (rng_u32(chunk_seed, 0x02) % 4) as i16;
-
-        let (mob_a, mob_b) = BIOME_MOBS[biome as usize];
-        let elements = self.generate_chunk_elements(chunk_x, chunk_z, biome);
-
+        let (mob_a, mob_b) = map.mobs[BLOB_MAP[lx][lz] as usize];
+        // Start-area biome overrides should also use that biome's creature list.
+        let (mob_a, mob_b) = if biome == map.biomes[lx][lz] {
+            (mob_a, mob_b)
+        } else {
+            mob_pair(biome, &mut Rng::new(chunk_seed ^ 0x4d4f4253))
+        };
         ChunkBiomeParams {
-            biome,
+            biome: biome as i16,
             floor_rot,
             floor_tex,
             mob_a: mob_a.to_string(),
             mob_b: mob_b.to_string(),
-            elements,
+            elements: self.generate_chunk_elements(x, z, biome as i16),
         }
     }
 
-    /// Generates natural objects for a chunk.
-    ///
-    /// Uses a per-chunk seeded RNG (independent from biome/floor RNG).
-    /// Object counts and clustering behaviour vary per biome.
-    /// Multi-tile objects occupy all covered cells in the occupancy bitset but
-    /// are stored as a single element at their top-left tile.
-    fn generate_chunk_elements(&self, chunk_x: i32, chunk_z: i32, biome: i16) -> Vec<PlacedObject> {
-        // Spawn-pad chunks are kept clear of all natural objects.
-        if matches!((chunk_x, chunk_z), (-1, 0) | (-1, 1) | (-2, 0) | (-2, 1)) {
+    fn generate_chunk_elements(&self, x: i32, z: i32, biome: i16) -> Vec<PlacedObject> {
+        // Preserve the server's existing spawn-pad override.
+        if matches!((x, z), (-1, 0) | (-1, 1) | (-2, 0) | (-2, 1)) {
             return Vec::new();
         }
-
-        let table = biome_object_table(biome);
-        if table.is_empty() {
-            return Vec::new();
-        }
-
-        // Separate RNG stream from floor properties (uses 0x01/0x02 as salts).
-        let chunk_salt = (chunk_x as u64)
+        let chunk_salt = (x as u64)
             .wrapping_mul(0x9e3779b97f4a7c15)
-            .wrapping_add((chunk_z as u64).wrapping_mul(0x6c62272e07bb0142));
-        let obj_seed = splitmix64(self.template.seed ^ chunk_salt ^ 0x0101_0101_0101_0101);
-        let mut ctr: u64 = 0;
-        let mut rng = |modulus: u32| -> u32 {
-            ctr += 1;
-            rng_u32(obj_seed, ctr) % modulus
-        };
-
-        let total_weight: u32 = table.iter().map(|e| e.1).sum();
-
-        // SwampDark: 70% chance the chunk is completely empty.
-        if biome as u8 == BIOME_SWAMP_DARK && rng(10) >= 3 {
-            return Vec::new();
-        }
-
-        // Per-biome base object count range [min, max].
-        let (min_obj, max_obj): (usize, usize) = match biome as u8 {
-            BIOME_SWAMP_DARK    => (0, 1),
-            BIOME_OCEAN         => (1, 2),
-            BIOME_OCEAN_SHALLOW => (1, 3),
-            BIOME_SNOW          => (1, 4),
-            BIOME_DESERT        => (1, 4),
-            BIOME_SWAMP         => (1, 3),
-            _                   => (2, 5),
-        };
-        let num_objects = min_obj + rng((max_obj - min_obj + 1) as u32) as usize;
-
-        let mut occupied: u128 = 0;
-        let mut elements: Vec<PlacedObject> = Vec::with_capacity(num_objects + 8);
-        let mut spirit_tree_pos: Option<(u8, u8)> = None;
-        let mut has_mossy_tree = false;
-
-        // Grass area character: 0 = vein-heavy, 1 = tree-heavy, 2 = balanced.
-        // Zones are ~8 chunks wide. Balanced is the most common outcome (60%);
-        // vein-heavy and tree-heavy each occur ~20% of the time.
-        let grass_mode: u8 = if biome as u8 == BIOME_GRASS {
-            let cx = (chunk_x >> 3) as u64;
-            let cz = (chunk_z >> 3) as u64;
-            let raw = splitmix64(
-                self.template.seed
-                    ^ cx.wrapping_mul(0x9e3779b97f4a7c15)
-                    .wrapping_add(cz.wrapping_mul(0x6c62272e07bb0142)),
-            ) % 5;
-            match raw {
-                0 => 0, // vein-heavy  (20%)
-                1 => 1, // tree-heavy  (20%)
-                _ => 2, // balanced    (60%)
-            }
-        } else {
-            2
-        };
-
-        'outer: for _ in 0..num_objects {
-            let mut roll = rng(total_weight);
-            let mut chosen = &table[table.len() - 1];
-            for entry in table {
-                if roll < entry.1 {
-                    chosen = entry;
-                    break;
-                }
-                roll -= entry.1;
-            }
-            let (name, _, size) = *chosen;
-            let rotation = rng(4) as u8;
-
-            for _ in 0..10 {
-                let max_pos = 10u32.saturating_sub(size as u32);
-                let tx = rng(max_pos + 1);
-                let tz = rng(max_pos + 1);
-                let mut mask: u128 = 0;
-                for dz in 0..(size as u32) {
-                    for dx in 0..(size as u32) {
-                        mask |= 1u128 << ((tz + dz) * 10 + (tx + dx));
-                    }
-                }
-                if occupied & mask == 0 {
-                    occupied |= mask;
-                    if name == "Spirit Tree" {
-                        spirit_tree_pos = Some((tx as u8, tz as u8));
-                    }
-                    if name == "Mossy Tree" {
-                        has_mossy_tree = true;
-                    }
-                    elements.push(PlacedObject {
-                        cell_x:    tx as u8,
-                        cell_z:    tz as u8,
-                        rotation,
-                        item_data: pack_item(name),
-                    });
-
-                    // Biome-specific cluster spawning after placement.
-                    match biome as u8 {
-                        BIOME_GRASS => match name {
-                            // Tree density varies by grass_mode: 0=vein-heavy (1-2 sparse trees),
-                            // 1=tree-heavy (dense), 2=balanced (light cluster). All use wide spacing.
-                            "Mossy Tree" => match grass_mode {
-                                0 => {
-                                    // Vein-heavy: still place 1-2 trees but spread out
-                                    let n = 1 + rng(2);
-                                    place_cluster("Mossy Tree", 2, n, tx as u8, tz as u8, 5, &mut occupied, &mut elements, &mut rng);
-                                }
-                                1 => {
-                                    let n = 2 + rng(3);
-                                    place_cluster("Mossy Tree", 2, n, tx as u8, tz as u8, 5, &mut occupied, &mut elements, &mut rng);
-                                }
-                                _ => {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Mossy Tree", 2, n, tx as u8, tz as u8, 4, &mut occupied, &mut elements, &mut rng);
-                                }
-                            },
-                            "Metal Vein" => match grass_mode {
-                                0 => {
-                                    if rng(2) == 0 {
-                                        let n = 1 + rng(3);
-                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                                1 => {
-                                    if rng(8) == 0 {
-                                        let n = 1 + rng(2);
-                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                                _ => {
-                                    if rng(4) == 0 {
-                                        let n = 1 + rng(2);
-                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                            },
-                            "Large Metal Vein" => match grass_mode {
-                                0 => {
-                                    let n = 1 + rng(3);
-                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                                1 => {
-                                    if rng(4) == 0 {
-                                        let n = 1 + rng(2);
-                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                                _ => {
-                                    if rng(2) == 0 {
-                                        let n = 1 + rng(2);
-                                        place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                            },
-                            "Stone Vein" => match grass_mode {
-                                0 => {
-                                    if rng(4) == 0 {
-                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                                1 => {} // tree-heavy: stone veins don't cluster
-                                _ => {
-                                    if rng(8) == 0 {
-                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                            },
-                            "Large Stone Vein" => match grass_mode {
-                                0 => {
-                                    if rng(2) == 0 {
-                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                                1 => {}
-                                _ => {
-                                    if rng(4) == 0 {
-                                        place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                    }
-                                }
-                            },
-                            "Cotton Plant" => {
-                                if rng(4) == 0 {
-                                    let n = 2 + rng(4);
-                                    place_cluster("Cotton Plant", 1, n, tx as u8, tz as u8, 1, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            _ => {}
-                        },
-                        BIOME_SNOW => match name {
-                            "MoonBerry Bush" => {
-                                let n = 1 + rng(4);
-                                place_cluster("MoonBerry Bush", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                            }
-                            "Titanium Vein" => {
-                                if rng(4) == 0 {
-                                    place_cluster("Titanium Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Stone Vein (Snowy)" => {
-                                if rng(8) == 0 {
-                                    place_cluster("Stone Vein (Snowy)", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            _ => {}
-                        },
-                        BIOME_DESERT => match name {
-                            "Gold Vein" => {
-                                if rng(4) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Gold Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Uranium Vein" => {
-                                if rng(4) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Uranium Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Stone Vein (Desert)" => {
-                                if rng(8) == 0 {
-                                    place_cluster("Stone Vein (Desert)", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            _ => {}
-                        },
-                        BIOME_EVERGREEN => match name {
-                            "Metal Vein" => {
-                                if rng(4) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Giant Red Mushroom" => {
-                                let r = 1 + rng(2);
-                                place_cluster("Dug-Up Red Mushroom", 1, r, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                let b = 1 + rng(2);
-                                place_cluster("Dug-up Brown Mushroom", 1, b, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                            }
-                            "Dug-up Brown Mushroom" => {
-                                if rng(10) < 2 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Dug-up Brown Mushroom", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Dug-Up Red Mushroom" => {
-                                if rng(10) < 2 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Dug-Up Red Mushroom", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Stone Vein" => {
-                                if rng(8) == 0 {
-                                    place_cluster("Stone Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            _ => {}
-                        },
-                        BIOME_WOODLANDS => match name {
-                            // Wheat always comes in small clusters of 2–5 (one placed, add 1–4).
-                            "Dug-Up Wheat" => {
-                                let n = 1 + rng(4);
-                                place_cluster("Dug-Up Wheat", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                            }
-                            // Brown mushrooms like clusters of 2–4 (add 1–3).
-                            "Dug-up Brown Mushroom" => {
-                                let n = 1 + rng(3);
-                                place_cluster("Dug-up Brown Mushroom", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                            }
-                            // Regular pumpkins rarely cluster (1–3 when they do).
-                            "Dug-up Pumpkin" => {
-                                if rng(4) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Dug-up Pumpkin", 1, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            // Veins cluster; the large variant is a rare cluster seed.
-                            "Metal Vein" => {
-                                if rng(4) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Large Metal Vein" => {
-                                if rng(3) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Stone Vein (White)" => {
-                                if rng(4) == 0 {
-                                    let n = 1 + rng(2);
-                                    place_cluster("Stone Vein (White)", 2, n, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Silver Vein" => {
-                                if rng(3) == 0 {
-                                    place_cluster("Silver Vein", 2, 1, tx as u8, tz as u8, 2, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            _ => {}
-                        },
-                        BIOME_SWAMP => match name {
-                            // Swamp clusters are small (1–2, rarely 3) and spaced out (radius 3).
-                            "Stone Vein" => {
-                                if rng(3) == 0 {
-                                    let n = if rng(10) == 0 { 2 } else { 1 };
-                                    place_cluster("Stone Vein", 2, n, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Metal Vein" => {
-                                if rng(3) == 0 {
-                                    let n = if rng(10) == 0 { 2 } else { 1 };
-                                    place_cluster("Metal Vein", 2, n, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            // Large veins rarely seed clusters here, and fill with the small variant.
-                            "Large Metal Vein" => {
-                                if rng(5) == 0 {
-                                    place_cluster("Metal Vein", 2, 1, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            "Dug-up Brown Mushroom" => {
-                                if rng(3) == 0 {
-                                    place_cluster("Dug-up Brown Mushroom", 1, 1, tx as u8, tz as u8, 3, &mut occupied, &mut elements, &mut rng);
-                                }
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-
-                    continue 'outer;
-                }
-            }
-        }
-
-        // Grass: guarantee at least one Mossy Tree so the biome never looks bare.
-        if biome as u8 == BIOME_GRASS && !has_mossy_tree {
-            place_cluster("Mossy Tree", 2, 1, 4, 4, 4, &mut occupied, &mut elements, &mut rng);
-        }
-
-        // Beach: always place one Spawner - Coconuts per OceanShallow chunk.
-        // Since beach = 1-2 chunks, this yields ~1-2 coconut spawners per beach.
-        if biome as u8 == BIOME_OCEAN_SHALLOW {
-            place_cluster("Spawner - Coconuts", 1, 1, 5, 5, 5, &mut occupied, &mut elements, &mut rng);
-        }
-
-        // Sakura: place a Spirit Branch near any Spirit Tree that spawned (50% chance).
-        if biome as u8 == BIOME_SAKURA {
-            if let Some((stx, stz)) = spirit_tree_pos {
-                if rng(2) == 0 {
-                    place_cluster("Spawner - Spirit Branch", 1, 1, stx, stz, 3, &mut occupied, &mut elements, &mut rng);
-                }
-            }
-        }
-
-        elements
+            .wrapping_add((z as u64).wrapping_mul(0x6c62272e07bb0142));
+        let mut rng = Rng::new(splitmix64(
+            self.template.seed ^ chunk_salt ^ 0x0101_0101_0101_0101,
+        ));
+        generate_objects(x, z, biome as u8, &mut rng)
     }
 }
 
-/// Places `count` copies of `name` (tile footprint `size`×`size`) within
-/// `radius` cells of `(anchor_x, anchor_z)`, respecting the occupancy bitset.
-fn place_cluster(
-    name:     &'static str,
-    size:     u8,
-    count:    u32,
-    anchor_x: u8,
-    anchor_z: u8,
-    radius:   i32,
-    occupied: &mut u128,
-    elements: &mut Vec<PlacedObject>,
-    rng:      &mut dyn FnMut(u32) -> u32,
-) {
-    let s   = size as i32;
-    let span = (radius * 2 + 1) as u32;
-    for _ in 0..count {
-        for _ in 0..10 {
-            let dx = rng(span) as i32 - radius;
-            let dz = rng(span) as i32 - radius;
-            let tx = (anchor_x as i32 + dx).clamp(0, 10 - s) as u32;
-            let tz = (anchor_z as i32 + dz).clamp(0, 10 - s) as u32;
-            let mut mask: u128 = 0;
-            for ddz in 0..(s as u32) {
-                for ddx in 0..(s as u32) {
-                    mask |= 1u128 << ((tz + ddz) * 10 + (tx + ddx));
-                }
-            }
-            if *occupied & mask == 0 {
-                *occupied |= mask;
-                let rotation = rng(4) as u8;
-                elements.push(PlacedObject {
-                    cell_x:    tx as u8,
-                    cell_z:    tz as u8,
-                    rotation,
-                    item_data: pack_item(name),
-                });
+/// ConstructionControl uses a rotated positive-quadrant 2x2 footprint and
+/// centered 3x3/5x5 footprints, never a top-left square for every object.
+fn geometry(name: &str, rotation: u8) -> Vec<(i8, i8)> {
+    match data::geometry_size(name) {
+        2 => match rotation {
+            0 => vec![(0, 0), (1, 0), (0, 1), (1, 1)],
+            1 => vec![(0, 0), (1, 0), (0, -1), (1, -1)],
+            2 => vec![(0, 0), (-1, 0), (0, -1), (-1, -1)],
+            _ => vec![(0, 0), (-1, 0), (0, 1), (-1, 1)],
+        },
+        size @ (3 | 5) => {
+            let radius = size / 2;
+            (-radius..=radius)
+                .flat_map(|x| (-radius..=radius).map(move |z| (x, z)))
+                .collect()
+        }
+        _ => vec![(0, 0)],
+    }
+}
+
+fn generated_item(name: &str, paint: &str, cx: i32, cz: i32, x: u8, z: u8) -> Vec<u8> {
+    if name == "Gold Chest" || name == "Titanium Chest" {
+        let id = super::NEXT_UNIQUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        pack_item_data(name, &[], &[], &[("basket_id", id)])
+    } else if matches!(
+        name,
+        "cave"
+            | "Personal Mine"
+            | "Grass Cave Entrance"
+            | "Snow Cave Entrance"
+            | "Desert Cave Entrance"
+            | "Evergreen Cave Entrance"
+            | "Ocean Cave Entrance"
+            | "Swamp Cave Entrance"
+    ) {
+        let id = super::NEXT_UNIQUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        pack_item_data(
+            name,
+            &[
+                ("outer_item_chunkX", cx as i16),
+                ("outer_item_chunkZ", cz as i16),
+                ("outer_item_innerX", x as i16),
+                ("outer_item_innerZ", z as i16),
+            ],
+            &[],
+            &[("shack_id", id)],
+        )
+    } else if name == "Flowers" {
+        pack_item_data(name, &[], &[("paint", paint)], &[])
+    } else {
+        pack_item(name)
+    }
+}
+
+fn mob_item(depth: f32, rng: &mut Rng) -> &'static str {
+    let (big, giant) = if depth >= 20.0 {
+        (
+            (depth * 0.001 + 0.03).min(1.0),
+            (depth * 0.00023 + 0.1).min(0.4),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    if rng.value() < giant {
+        "Mob - Giant"
+    } else if rng.value() < big {
+        "Mob - Big"
+    } else if rng.value() < (depth * -0.0275 + 1.0).max(0.0) {
+        "Mob - Tiny"
+    } else {
+        "Mob - Normal"
+    }
+}
+
+fn generate_objects(cx: i32, cz: i32, biome: u8, rng: &mut Rng) -> Vec<PlacedObject> {
+    let definition = &BIOMES[biome as usize];
+    let mut empties = Vec::with_capacity(100);
+    for x in 0..10 {
+        for z in 0..10 {
+            let index = rng.range(0, empties.len());
+            empties.insert(index, (x, z));
+        }
+    }
+    let mut filled = [[false; 10]; 10];
+    let mut elements = Vec::new();
+    let depth = chunk_depth(cx, cz);
+    let budget = rng.range(definition.scenic_budget.0, definition.scenic_budget.1 + 1);
+    generate_layer(
+        &mut elements,
+        budget,
+        true,
+        biome,
+        cx,
+        cz,
+        depth,
+        &mut empties,
+        &mut filled,
+        rng,
+    );
+    let budget = rng.range(definition.item_budget.0, definition.item_budget.1 + 1);
+    generate_layer(
+        &mut elements,
+        budget,
+        false,
+        biome,
+        cx,
+        cz,
+        depth,
+        &mut empties,
+        &mut filled,
+        rng,
+    );
+    if rng.value() < 0.251 {
+        let count = if rng.value() < 0.55 { 1 } else { 2 };
+        for _ in 0..count {
+            if empties.is_empty() {
                 break;
             }
+            let (x, z) = empties.remove(0);
+            elements.push(PlacedObject {
+                cell_x: x,
+                cell_z: z,
+                rotation: 0,
+                item_data: pack_item(mob_item(depth, rng)),
+            });
+        }
+    }
+    if !definition.dont_spawn_greens && rng.value() < 0.411 && !empties.is_empty() {
+        let mut count = if rng.value() < 0.6 { 2 } else { 3 };
+        let center = empties[0];
+        let mut i = 0;
+        while i < empties.len() {
+            let (x, z) = empties[i];
+            if distance(x as f32 - center.0 as f32, 0.0, z as f32 - center.1 as f32) < 2.5 {
+                empties.remove(i);
+                elements.push(PlacedObject {
+                    cell_x: x,
+                    cell_z: z,
+                    rotation: 0,
+                    item_data: pack_item("Green Blob"),
+                });
+                count -= 1;
+                if count == 0 {
+                    break;
+                }
+            }
+            // Match the client's forward scan after removing a list entry.
+            i += 1;
+        }
+    }
+    elements
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_layer(
+    elements: &mut Vec<PlacedObject>,
+    budget: usize,
+    scenic: bool,
+    biome: u8,
+    cx: i32,
+    cz: i32,
+    depth: f32,
+    empties: &mut Vec<(u8, u8)>,
+    filled: &mut [[bool; 10]; 10],
+    rng: &mut Rng,
+) {
+    let objects = BIOMES[biome as usize].objects;
+    let mut pools: [Vec<usize>; 4] = std::array::from_fn(|_| Vec::new());
+    for (i, obj) in objects.iter().enumerate() {
+        if scenic == obj.is_item {
+            continue;
+        }
+        match obj.rarity {
+            0..=3 => pools[obj.rarity as usize].push(i),
+            4 => pools[0].extend([i, i]),
+            5 => pools[0].extend([i, i, i]),
+            _ => {}
+        }
+    }
+    for _ in 0..budget {
+        let special = if biome != BIOME_SWAMP_DARK && biome != BIOME_OCEAN && !scenic {
+            if rng.float_range(0.001, 1.0) < 0.042 {
+                Some(("Titanium Chest", true))
+            } else if rng.float_range(0.001, 1.0) < 0.075 {
+                Some(("Gold Chest", true))
+            } else if depth > 15.0 && rng.float_range(0.001, 1.0) < 0.096 {
+                Some(("Creature Nest", false))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let obj = if let Some((name, dont_rotate)) = special {
+            ObjectDefinition {
+                name,
+                is_item: true,
+                rarity: 0,
+                clump: (0, 0),
+                clump_overwrite: "",
+                dont_rotate,
+                min_depth: 0.0,
+            }
+        } else {
+            let mut rarity = 0;
+            if rng.value() >= 0.62 {
+                rarity = 1;
+                if rng.value() >= 0.7 {
+                    rarity = 3;
+                    if rng.value() < 0.85 {
+                        rarity = 2;
+                    }
+                }
+            }
+            let pool = if pools[rarity].is_empty() {
+                &pools[0]
+            } else {
+                &pools[rarity]
+            };
+            if pool.is_empty() {
+                continue;
+            }
+            objects[pool[rng.range(0, pool.len())]]
+        };
+        if obj.min_depth > depth {
+            continue;
+        }
+        let mut remaining = rng.range(obj.clump.0, obj.clump.1 + 1);
+        let mut name = obj.name;
+        let paint = if name == "Flowers" {
+            PAINTS[rng.range(0, PAINTS.len())]
+        } else {
+            ""
+        };
+        let mut anchor = (0, 0);
+        let mut placed = false;
+        let mut i = 0;
+        while i < empties.len() {
+            let (x, z) = empties[i];
+            let rotation = rng.range(0, 4) as u8;
+            let rotation = if obj.dont_rotate { 0 } else { rotation };
+            let footprint = geometry(name, rotation);
+            let cells: Vec<(i8, i8)> = footprint
+                .iter()
+                .map(|(dx, dz)| (x as i8 + dx, z as i8 + dz))
+                .collect();
+            if cells.iter().any(|(x, z)| {
+                !(0..10).contains(x) || !(0..10).contains(z) || filled[*x as usize][*z as usize]
+            }) {
+                i += 1;
+                continue;
+            }
+            if !placed
+                || distance(x as f32 - anchor.0 as f32, 0.0, z as f32 - anchor.1 as f32) <= 3.5
+            {
+                elements.push(PlacedObject {
+                    cell_x: x,
+                    cell_z: z,
+                    rotation,
+                    item_data: generated_item(name, paint, cx, cz, x, z),
+                });
+                for (x, z) in &cells {
+                    filled[*x as usize][*z as usize] = true;
+                }
+                empties.retain(|(x, z)| !cells.contains(&(*x as i8, *z as i8)));
+                if !placed {
+                    anchor = (x, z);
+                    if !obj.clump_overwrite.trim().is_empty() {
+                        name = obj.clump_overwrite;
+                    }
+                }
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+            }
+            placed = true;
+            i += 1;
+        }
+    }
+}
+
+/// Keep generated container/entrance IDs above IDs already present in a saved
+/// world. This changes no saved chunks or generation seeds.
+pub(super) fn reserve_item_ids(bytes: &[u8]) {
+    use crate::defs::packet::unpack_string;
+    if bytes.len() < 2 {
+        return;
+    }
+    let mut offset = 2;
+    let shorts = u16::from_le_bytes([bytes[0], bytes[1]]);
+    for _ in 0..shorts {
+        let (_, next) = unpack_string(bytes, offset);
+        offset = next.saturating_add(2);
+    }
+    if offset + 2 > bytes.len() {
+        return;
+    }
+    let strings = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    offset += 2;
+    for _ in 0..strings {
+        let (_, next) = unpack_string(bytes, offset);
+        let (_, next) = unpack_string(bytes, next);
+        offset = next;
+    }
+    if offset + 2 > bytes.len() {
+        return;
+    }
+    let longs = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    offset += 2;
+    for _ in 0..longs {
+        let (key, next) = unpack_string(bytes, offset);
+        offset = next;
+        if offset + 4 > bytes.len() {
+            return;
+        }
+        let id = i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        if key == "basket_id" || key == "shack_id" {
+            super::NEXT_UNIQUE_ID.fetch_max(id as i64 + 1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
