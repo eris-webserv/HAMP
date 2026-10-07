@@ -549,7 +549,7 @@ mod batch_tests {
 
     // ── Real-capture fixtures ──────────────────────────────────────────────
     //
-    // Drop captured client→server bytes from Segual here as a hex string (the
+    // Drop captured client→server bytes here as a hex string (the
     // raw TCP payload, one or more batches concatenated, exactly as logged).
     // `decode_hex` + `split` will exercise the real wire against the splitter.
 
@@ -584,7 +584,7 @@ mod batch_tests {
     }
 
     #[test]
-    #[ignore = "fill in with a real capture from Segual"]
+    #[ignore = "fill in with a real client capture"]
     fn real_screenshot_capture_reassembles() {
         // Example: paste the logged hex of a full 0x30 upload here.
         let capture = "";

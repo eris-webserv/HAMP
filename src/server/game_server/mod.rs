@@ -18,6 +18,7 @@
 
 pub mod baskets;
 pub mod generator;
+mod mobs;
 pub mod packets_client;
 pub mod packets_server;
 pub mod persist;
@@ -164,6 +165,8 @@ struct GamePlayer {
     /// Current zone (e.g. "overworld", "cave_zone"). Used to filter visibility —
     /// players only see other players in the same zone.
     zone:         Mutex<String>,
+    /// Session init must follow the client's map-clear/player-data round trip.
+    init_scheduled: AtomicBool,
 }
 
 // ── Session mode ──────────────────────────────────────────────────────────
@@ -213,6 +216,8 @@ pub(crate) struct Session {
     /// MOD_HELLO — i.e. this is a "Normal" server. Set true for an "Anarchy"
     /// server that accepts debug clients. See HAMP_MOD_PROTOCOL.md.
     allow_debug: bool,
+    /// Simulation ownership and last movement snapshots for companions/mobs.
+    mobs: Mutex<mobs::Mobs>,
 }
 
 impl Session {
@@ -233,6 +238,7 @@ impl Session {
             admin_users,
             tele_search: Mutex::new(HashMap::new()),
             mod_clients: Mutex::new(HashMap::new()),
+            mobs: Mutex::new(mobs::Mobs::default()),
         })
     }
 
@@ -781,6 +787,25 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     session.room_token, uid, addr, pid, pkt_name(pid), to_hex_upper(data));
             }
 
+            // Track lifecycle without altering the existing companion relays
+            // or their player-name prefixes.
+            if let Some(ref uid) = player_id {
+                match pid {
+                    0x59 => {
+                        if let Some(id) = mobs::single_id(&data[10..]) {
+                            session.mobs.lock().unwrap().register(uid, id);
+                        }
+                    }
+                    0x40 | 0x50 => {
+                        if let Some(id) = mobs::single_id(&data[10..]) {
+                            session.mobs.lock().unwrap().release(uid, &id);
+                        }
+                    }
+                    0x41 => session.mobs.lock().unwrap().remember_positions(uid, &data[10..]),
+                    _ => {}
+                }
+            }
+
         match pid {
 
             // ── PING (0x01) ────────────────────────────────────────────────
@@ -796,13 +821,13 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // ── LOGIN (0x26) ───────────────────────────────────────────────
             // C→S: [world_name: Str] [token: Str]
             //
-            // Response sequence (matching Python game_server.py):
+            // Login response sequence:
             //   S→C 0x26  LOGIN_RESPONSE
-            //   S→C 0x2A  UNIQUE_IDS
             //   S→C 0x02  JOIN_CONFIRMED
-            //   S→C 0x0B  ZONE_DATA
-            //   S→C 0x17  DAYNIGHT
             //   S→C 0x07  JOIN_NOTIF (broadcast)
+            // After C→S 0x03 and a frame-end grace period:
+            //   S→C 0x05  SESSION_INIT (IDs, day/night, companion cap)
+            //   S→C 0x0B  ZONE_DATA
             0x26 => {
                 if player_id.is_some() { continue; } // ignore repeated logins
 
@@ -824,8 +849,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     sink:         Mutex::new(cloned),
                     initial_data: Mutex::new(None),
                     zone:         Mutex::new("overworld".to_string()),
+                    init_scheduled: AtomicBool::new(false),
                 });
-                session.players.lock().unwrap().insert(uid.clone(), Arc::clone(&player));
+                {
+                    let mut players = session.players.lock().unwrap();
+                    if players.contains_key(&uid) {
+                        let mut packet = vec![0x01];
+                        packet.extend(pack_string("This username is already connected. Use a different username on the other device."));
+                        let _ = write_payload(&mut stream, 2, &packet);
+                        break 'outer;
+                    }
+                    players.insert(uid.clone(), Arc::clone(&player));
+                }
                 player_id = Some(uid.clone());
 
                 // Track in world state for position management.
@@ -881,26 +916,10 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 // 2. S→C 0x02: join confirmed (is_host=true for host, false for guests)
                 let _ = write_payload(&mut stream, 2, &JoinConfirmed { server_name: &world, username: &uid, is_host: is_host_flag }.to_payload());
 
-                // 3. S→C 0x05: session init — delivers unique IDs and session state.
-                //    unique IDs go here (uid_count field), not as standalone 0x2A.
-                //    skip_saved_pos=1 prevents the client from overriding our spawn.
-                const INITIAL_ID_BLOCK: u16 = 64;
-                let id_start = NEXT_UNIQUE_ID.fetch_add(INITIAL_ID_BLOCK as i64, Ordering::Relaxed);
-                let _ = write_payload(&mut stream, 2, &SessionInit {
-                    daynight_ms:    12000,
-                    client_is_mod:  session.is_admin(&uid),
-                    max_companions: 3,
-                    pvp_enabled:    session.pvp_enabled,
-                    uid_start:      id_start,
-                    uid_count:      INITIAL_ID_BLOCK,
-                }.to_payload());
-
-                // 4. S→C 0x0B: zone data
-                let zone_name = match session.mode {
-                    SessionMode::Managed(ref ws) => ws.default_zone.clone(),
-                    SessionMode::Relay => "overworld".to_string(),
-                };
-                let _ = write_payload(&mut stream, 2, &ZoneData { zone_name: &zone_name, interior: None }.to_payload());
+                // SessionInit recreates companions. Do not send it alongside
+                // JoinConfirmed: ClearPreviousMap queues their old objects for
+                // Unity's end-of-frame destruction, whose Combatant.OnDestroy
+                // removes combat IDs. Wait for PLAYER_DATA before recreating.
 
                 // 6. S→C 0x07: join notification (broadcast to others)
                 session.broadcast(&JoinNotif { username: &uid, joined: true }, Some(uid.as_str()));
@@ -963,7 +982,9 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             } else {
                                 ws.default_zone.clone()
                             };
-                            if effective != ws.default_zone {
+                            let initialized = session.players.lock().unwrap().get(uid)
+                                .is_some_and(|p| p.init_scheduled.load(Ordering::Relaxed));
+                            if initialized && effective != ws.default_zone {
                                 let _ = write_payload(&mut stream, 2,
                                     &ZoneData { zone_name: &effective, interior: None }.to_payload());
                             }
@@ -1008,6 +1029,36 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                         if let Some(p) = session.players.lock().unwrap().get(uid.as_str()) {
                             *p.initial_data.lock().unwrap() = Some(opd.clone());
                             *p.zone.lock().unwrap() = zone_name.clone();
+                            if !p.init_scheduled.swap(true, Ordering::Relaxed) {
+                                let player = Arc::clone(p);
+                                let sess = Arc::clone(&session);
+                                let user = uid.clone();
+                                let initial_zone = zone_name.clone();
+                                std::thread::spawn(move || {
+                                    // Destroy() is deferred until frame end in
+                                    // Unity. Give the join/map-clear callback
+                                    // time to finish before spawning the same
+                                    // combat IDs in the next receive pass.
+                                    std::thread::sleep(std::time::Duration::from_millis(300));
+                                    let connected = sess.players.lock().unwrap().get(&user)
+                                        .is_some_and(|current| Arc::ptr_eq(current, &player));
+                                    if !connected { return; }
+                                    const INITIAL_ID_BLOCK: u16 = 64;
+                                    let id_start = NEXT_UNIQUE_ID.fetch_add(INITIAL_ID_BLOCK as i64, Ordering::Relaxed);
+                                    let init = SessionInit {
+                                        daynight_ms: 12000,
+                                        client_is_mod: sess.is_admin(&user),
+                                        max_companions: 3,
+                                        pvp_enabled: sess.pvp_enabled,
+                                        uid_start: id_start,
+                                        uid_count: INITIAL_ID_BLOCK,
+                                    }.to_payload();
+                                    let zone = ZoneData { zone_name: &initial_zone, interior: None }.to_payload();
+                                    let mut sink = player.sink.lock().unwrap();
+                                    let _ = write_payload(&mut *sink, 2, &init);
+                                    let _ = write_payload(&mut *sink, 2, &zone);
+                                });
+                            }
                         }
 
                         // Delayed sync: wait 2s then broadcast + reciprocal sync.
@@ -1044,6 +1095,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                             for (name, init) in &existing {
                                 let disp = get_display(name);
                                 sess.send_to(&uid_owned, &PlayerNearby { username: name, display: &disp, opd: init }.to_payload());
+                                let positions = sess.mobs.lock().unwrap().positions(name);
+                                if let Some(packet) = positions { sess.send_to(&uid_owned, &packet); }
                             }
                             // For each existing player that has a basket open, send
                             // 0x27 so the newcomer's AnyoneUsing (field+48) is set.
@@ -1568,8 +1621,11 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
                     // Send "gone" to old zone players.
                     if old_zone != zone_name {
-                        session.broadcast_zone(
-                            &PlayerGone { username: uid }, &old_zone, Some(uid.as_str()));
+                        let ids = session.mobs.lock().unwrap().ids(uid);
+                        for packet in mobs::gone_packets(uid, &ids) {
+                            session.broadcast_zone(&packet, &old_zone, Some(uid.as_str()));
+                        }
+                        session.mobs.lock().unwrap().leave_zone(uid);
                     }
 
                     // Update player zone tracker. Clear currently_using because the
@@ -2411,11 +2467,18 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
-            // ── TRY_CLAIM_MOBS (0x3F) — relay to host ──────────────────
-            // C→S: [i16 count][mob data...] — host processes mob ownership
+            // ── TRY_CLAIM_MOBS (0x3F) ──────────────────────────────────
+            // C→S: [u8 count][str combat_id]×count
+            // Managed S→C: [u8 count][str combat_id][u8 succeeded]×count
+            // Relay worlds continue delegating the request to their host.
             0x3F => {
                 if let Some(ref uid) = player_id {
-                    if matches!(session.mode, SessionMode::Relay) {
+                    if matches!(session.mode, SessionMode::Managed(_)) {
+                        let response = session.mobs.lock().unwrap().claim(uid, &data[10..]);
+                        if let Some(packet) = response {
+                            let _ = write_payload(&mut stream, 2, &packet);
+                        }
+                    } else {
                         let host = session.host.lock().unwrap().clone();
                         if let Some(ref hname) = host {
                             let mut relay = vec![0x3Fu8];
@@ -2427,12 +2490,32 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 }
             }
 
+            // A peer with a still-loaded world mob offers to take simulation
+            // after its previous owner deloads it (GameServerReceiver case 64).
+            // Personal companions remain owned until released/disconnected.
+            0x44 if matches!(session.mode, SessionMode::Managed(_)) => {
+                if let Some(ref uid) = player_id {
+                    if let Some(id) = mobs::single_id(&data[10..]) {
+                        if id == "LOCAL" || session.players.lock().unwrap().contains_key(&id) {
+                            continue; // a player body is never transferable mob AI
+                        }
+                        let mut request = vec![1];
+                        request.extend(pack_string(&id));
+                        let response = session.mobs.lock().unwrap().claim(uid, &request);
+                        if response.is_some_and(|packet| packet.last() == Some(&1)) {
+                            let mut packet = vec![0x45];
+                            packet.extend(pack_string(&id));
+                            let _ = write_payload(&mut stream, 2, &packet);
+                        }
+                    }
+                }
+            }
+
             // ── DELOAD_MOB (0x40) — broadcast ───────────────────────────
             // C→S: [str combat_id]
             0x40 => {
                 if let Some(ref uid) = player_id {
                     let mut pkt = vec![0x40u8];
-                    pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
                     session.broadcast(&pkt, Some(uid.as_str()));
                 }
@@ -2640,6 +2723,8 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             .get(uid.as_str())
             .map(|p| p.zone.lock().unwrap().clone())
             .unwrap_or_default();
+        let mob_ids = session.mobs.lock().unwrap().ids(uid);
+        session.mobs.lock().unwrap().disconnect(uid);
         session.players.lock().unwrap().remove(uid.as_str());
         session.open_baskets.lock().unwrap().retain(|_, (holder, _)| holder != uid);
         session.mod_clients.lock().unwrap().remove(uid.as_str());
@@ -2647,7 +2732,9 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
         session.broadcast_zone(
             &ReleaseInteractingObject { player: uid },
             &player_zone, Some(uid.as_str()));
-        session.broadcast(&PlayerGone { username: uid }, None);
+        for packet in mobs::gone_packets(uid, &mob_ids) {
+            session.broadcast(&packet, None);
+        }
         session.broadcast(&JoinNotif { username: uid, joined: false }, None);
 
         // Remove from world state tracking.
@@ -2888,6 +2975,138 @@ pub fn spawn_relay_session(room_token: String, cfg: &Config) -> Option<u16> {
     None
 }
 
+
+#[cfg(test)]
+mod companion_tests {
+    use super::*;
+    use crate::defs::packet::craft_batch;
+    use std::io::Write;
+
+    fn send(client: &mut TcpStream, opcode: u8, body: &[u8]) {
+        let mut payload = vec![opcode];
+        payload.extend_from_slice(body);
+        client.write_all(&craft_batch(2, &payload)).unwrap();
+    }
+
+    fn receive(client: &mut TcpStream, opcode: u8) -> Vec<u8> {
+        loop {
+            let mut length = [0; 2];
+            client.read_exact(&mut length).unwrap();
+            let length = u16::from_le_bytes(length) as usize;
+            let mut frame = vec![0; length - 2];
+            client.read_exact(&mut frame).unwrap();
+            let payload = &frame[7..];
+            if payload[0] == opcode { return payload.to_vec(); }
+        }
+    }
+
+    fn connect(session: &Arc<Session>, username: &str) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        let (server, addr) = listener.accept().unwrap();
+        let session = Arc::clone(session);
+        let thread = std::thread::spawn(move || handle_client(server, addr, session, None));
+        let mut login = pack_string("test-world");
+        login.extend(pack_string(username));
+        send(&mut client, 0x26, &login);
+        receive(&mut client, 0x02);
+        // Unity clears the previous map in case 2 and then sends 0x03.
+        // No companion recreation may be queued in that same receive pass.
+        client.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+        assert!(client.read(&mut [0u8; 1]).is_err());
+        client.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        let mut initial = vec![0u8; 8];
+        initial.extend(pack_string("overworld"));
+        initial.push(0); // body slot
+        initial.extend(1i32.to_le_bytes());
+        initial.extend([0u8; 18]); // empty equipment
+        for _ in 0..3 { initial.extend(10i32.to_le_bytes()); }
+        initial.extend(0i16.to_le_bytes()); // creature parents
+        send(&mut client, 0x03, &initial);
+        receive(&mut client, 0x05);
+        receive(&mut client, 0x0B); // last unicast login packet
+        (client, thread)
+    }
+
+    #[test]
+    fn managed_companion_lifecycle_and_claim_transfer_over_tcp() {
+        let template = WorldTemplate::new(123, vec![ZoneConfig::new("overworld", BiomeWeights::default())]);
+        let world = Arc::new(WorldState::new("test", 0, template));
+        let session = Session::new("test", SessionMode::Managed(world), false, false, vec![], false);
+        let (mut alice, alice_thread) = connect(&session, "alice");
+        let (mut bob, bob_thread) = connect(&session, "bob");
+
+        let pet = pack_string("alice-pet");
+        send(&mut alice, 0x59, &pet);
+        send(&mut alice, 0x01, &[]);
+        receive(&mut alice, 0x01); // registration has completed
+        assert_eq!(session.mobs.lock().unwrap().ids("alice"), ["alice-pet"]);
+
+        // Preserve all three existing player-prefixed companion relays.
+        let mut equipment = pet.clone();
+        equipment.extend([0u8; 18]); // three empty InventoryItems
+        let mut rename = pet.clone();
+        rename.extend(pack_string("Buddy"));
+        for (opcode, body) in [(0x4E, &equipment), (0x4F, &rename)] {
+            send(&mut alice, opcode, body);
+            let mut expected = vec![opcode];
+            expected.extend(pack_string("alice"));
+            expected.extend(body);
+            assert_eq!(receive(&mut bob, opcode), expected);
+        }
+
+        let mut claim = vec![1];
+        claim.extend(&pet);
+        send(&mut bob, 0x3F, &claim);
+        assert_eq!(receive(&mut bob, 0x3F).last(), Some(&0));
+
+        let mut positions = vec![1];
+        positions.extend(&pet);
+        positions.extend([0u8; 24]);
+        send(&mut alice, 0x41, &positions);
+        let movement = receive(&mut bob, 0x41);
+        send(&mut alice, 0x01, &[]);
+        receive(&mut alice, 0x01);
+        assert_eq!(session.mobs.lock().unwrap().positions("alice").unwrap(), movement);
+
+        let guard = pack_string("world-guard");
+        let mut claim = vec![1];
+        claim.extend(&guard);
+        send(&mut alice, 0x3F, &claim);
+        assert_eq!(receive(&mut alice, 0x3F).last(), Some(&1));
+        send(&mut bob, 0x3F, &claim);
+        assert_eq!(receive(&mut bob, 0x3F).last(), Some(&0));
+        send(&mut alice, 0x40, &guard);
+        let mut deload = vec![0x40];
+        deload.extend(&guard);
+        assert_eq!(receive(&mut bob, 0x40), deload);
+        send(&mut bob, 0x44, &guard);
+        let mut expected = vec![0x45];
+        expected.extend(&guard);
+        assert_eq!(receive(&mut bob, 0x45), expected);
+
+        send(&mut alice, 0x50, &pet);
+        let mut expected = vec![0x50];
+        expected.extend(pack_string("alice"));
+        expected.extend(&pet);
+        assert_eq!(receive(&mut bob, 0x50), expected);
+        assert!(session.mobs.lock().unwrap().ids("alice").is_empty());
+
+        // A new companion is included in the owner departure notification.
+        send(&mut alice, 0x59, &pet);
+        send(&mut alice, 0x01, &[]);
+        receive(&mut alice, 0x01);
+        alice.shutdown(std::net::Shutdown::Both).unwrap();
+        alice_thread.join().unwrap();
+        let expected = mobs::gone_packets("alice", &["alice-pet".into()]);
+        assert_eq!(receive(&mut bob, 0x13), expected[0]);
+        assert!(session.mobs.lock().unwrap().ids("alice").is_empty());
+        bob.shutdown(std::net::Shutdown::Both).unwrap();
+        bob_thread.join().unwrap();
+        session.stop();
+    }
+}
 
 #[cfg(test)]
 mod tele_tests {
