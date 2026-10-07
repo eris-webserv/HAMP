@@ -18,6 +18,7 @@
 
 pub mod baskets;
 pub mod generator;
+mod mobs;
 pub mod packets_client;
 pub mod packets_server;
 pub mod persist;
@@ -206,6 +207,7 @@ pub(crate) struct Session {
     /// Last teleporter search term per player (managed mode). Search-page
     /// requests (0x2E with in_search=1) page through results for this term.
     tele_search: Mutex<HashMap<String, String>>,
+    wildlife: Mutex<mobs::Wildlife>,
     /// Players that completed the MOD_HELLO (0xE0) handshake, keyed by
     /// username. Custom packets are only ever sent to players in this map.
     mod_clients: Mutex<HashMap<String, ModClientInfo>>,
@@ -232,6 +234,7 @@ impl Session {
             open_baskets: Mutex::new(HashMap::new()),
             admin_users,
             tele_search: Mutex::new(HashMap::new()),
+            wildlife: Mutex::new(mobs::Wildlife::default()),
             mod_clients: Mutex::new(HashMap::new()),
         })
     }
@@ -1516,7 +1519,9 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                     let mut pkt = vec![0x41u8];
                     pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
-                    session.broadcast(&pkt, Some(uid.as_str()));
+                    let zone = session.players.lock().unwrap().get(uid)
+                        .map(|p| p.zone.lock().unwrap().clone()).unwrap_or_default();
+                    session.broadcast_zone(&pkt, &zone, Some(uid.as_str()));
                 }
             }
 
@@ -1568,6 +1573,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
 
                     // Send "gone" to old zone players.
                     if old_zone != zone_name {
+                        if matches!(session.mode, SessionMode::Managed(_)) {
+                            let released = session.wildlife.lock().unwrap().release_player(uid);
+                            for (id, zone) in released {
+                                let mut pkt = vec![0x40];
+                                pkt.extend(pack_string(&id));
+                                session.broadcast_zone(&pkt, &zone, Some(uid));
+                            }
+                        }
                         session.broadcast_zone(
                             &PlayerGone { username: uid }, &old_zone, Some(uid.as_str()));
                     }
@@ -1917,7 +1930,22 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
                 if let Some(ref uid) = player_id {
                     let (_, off) = unpack_string(data, 10); // skip fn_validator
                     let mut pkt = vec![pid];
-                    pkt.extend_from_slice(&data[off..]);
+                    if pid == 0x48 {
+                        let Some((id, after_id)) = mobs::read_id(data, off) else { continue; };
+                        let (_, after_zone) = unpack_string(data, after_id + 4);
+                        if after_zone <= after_id + 4 || after_zone + 10 > data.len() { continue; }
+                        let respawn = i16::from_le_bytes([data[after_zone + 8], data[after_zone + 9]]);
+                        let (_, after_killer) = unpack_string(data, after_zone + 10);
+                        if after_killer <= after_zone + 10 || after_killer + 3 > data.len() { continue; }
+                        if matches!(session.mode, SessionMode::Managed(_)) {
+                            session.wildlife.lock().unwrap().died(&id, respawn.max(0) as u64);
+                        }
+                        // mob_type is a C→S field; the receiver starts with darksword here.
+                        pkt.extend_from_slice(&data[off..after_killer]);
+                        pkt.extend_from_slice(&data[after_killer + 1..]);
+                    } else {
+                        pkt.extend_from_slice(&data[off..]);
+                    }
                     session.broadcast(&pkt, Some(uid.as_str()));
                 }
             }
@@ -2412,9 +2440,16 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             }
 
             // ── TRY_CLAIM_MOBS (0x3F) — relay to host ──────────────────
-            // C→S: [i16 count][mob data...] — host processes mob ownership
+            // C→S: [u8 count][Str combat_id × count]. Managed sessions reply
+            // with [u8 count][Str combat_id, u8 succeeded × count].
             0x3F => {
                 if let Some(ref uid) = player_id {
+                    if matches!(session.mode, SessionMode::Managed(_)) {
+                        let zone = session.players.lock().unwrap().get(uid)
+                            .map(|p| p.zone.lock().unwrap().clone()).unwrap_or_default();
+                        let reply = session.wildlife.lock().unwrap().claim(uid, &zone, &data[10..]);
+                        if let Some(reply) = reply { session.send_to(uid, &reply); }
+                    }
                     if matches!(session.mode, SessionMode::Relay) {
                         let host = session.host.lock().unwrap().clone();
                         if let Some(ref hname) = host {
@@ -2431,10 +2466,44 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             // C→S: [str combat_id]
             0x40 => {
                 if let Some(ref uid) = player_id {
+                    if matches!(session.mode, SessionMode::Managed(_)) {
+                        if let Some((id, _)) = mobs::read_id(data, 10) {
+                            let zone = session.wildlife.lock().unwrap().release(uid, &id);
+                            if let Some(zone) = zone {
+                                let mut pkt = vec![0x40];
+                                pkt.extend(pack_string(&id));
+                                session.broadcast_zone(&pkt, &zone, Some(uid));
+                            }
+                        }
+                        continue;
+                    }
                     let mut pkt = vec![0x40u8];
                     pkt.extend(pack_string(uid));
                     pkt.extend_from_slice(&data[10..]);
                     session.broadcast(&pkt, Some(uid.as_str()));
+                }
+            }
+
+            // The first client still loading an unowned mob takes over its AI.
+            0x44 => {
+                if let Some(ref uid) = player_id {
+                    if matches!(session.mode, SessionMode::Managed(_)) {
+                        let zone = session.players.lock().unwrap().get(uid)
+                            .map(|p| p.zone.lock().unwrap().clone()).unwrap_or_default();
+                        if let Some((id, _)) = mobs::read_id(data, 10) {
+                            let inherited = session.wildlife.lock().unwrap().inherit(uid, &zone, &id);
+                            if inherited {
+                                let mut pkt = vec![0x45];
+                                pkt.extend(pack_string(&id));
+                                session.send_to(uid, &pkt);
+                            }
+                        }
+                    } else if let Some(host) = session.host.lock().unwrap().clone() {
+                        let mut pkt = vec![0x44];
+                        pkt.extend(pack_string(uid));
+                        pkt.extend_from_slice(&data[10..]);
+                        session.send_to(&host, &pkt);
+                    }
                 }
             }
 
@@ -2641,6 +2710,14 @@ fn handle_client(mut stream: TcpStream, addr: std::net::SocketAddr, session: Arc
             .map(|p| p.zone.lock().unwrap().clone())
             .unwrap_or_default();
         session.players.lock().unwrap().remove(uid.as_str());
+        if matches!(session.mode, SessionMode::Managed(_)) {
+            let released = session.wildlife.lock().unwrap().release_player(uid);
+            for (id, zone) in released {
+                let mut pkt = vec![0x40];
+                pkt.extend(pack_string(&id));
+                session.broadcast_zone(&pkt, &zone, None);
+            }
+        }
         session.open_baskets.lock().unwrap().retain(|_, (holder, _)| holder != uid);
         session.mod_clients.lock().unwrap().remove(uid.as_str());
         session.tele_search.lock().unwrap().remove(uid.as_str());

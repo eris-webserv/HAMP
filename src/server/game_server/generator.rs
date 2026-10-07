@@ -72,20 +72,18 @@ pub const BIOME_TEXTURE_COUNTS: [u8; 10] = [
     3, // Sakura
 ];
 
-/// Mob pair strings for each biome (mobA, mobB).
-/// These are used by client-side `ChunkControl` to spawn ambient mobs.
-/// Empty strings = no mobs.
-pub const BIOME_MOBS: [(&str, &str); 10] = [
-    ("",  ""),  // Grass
-    ("",  ""),  // Snow
-    ("",  ""),  // Desert
-    ("",  ""),  // Evergreen
-    ("",  ""),  // Ocean
-    ("",  ""),  // OceanShallow
-    ("",  ""),  // Swamp
-    ("",  ""),  // SwampDark
-    ("",  ""),  // Woodlands
-    ("",  ""),  // Sakura
+/// Animal pools serialized by the client, including inherited variant pools.
+const BIOME_ANIMALS: [&[&str]; 10] = [
+    &["alligator", "ant", "bat", "bear", "beaver", "bunny", "chicken", "chimpanzee", "duck", "dwarf", "frog", "goat", "goose", "gorilla", "horse", "human", "kitten", "pig", "poodle", "racoon", "sloth", "snail", "snake", "spider", "squirrel", "tiger", "trex", "wasp", "wolf", "hummingbird"],
+    &["bear", "bunny", "yeti", "horse", "human", "moose", "owl", "polarBear", "santa", "squirrel", "wolf", "shark"],
+    &["ant", "bat", "camel", "crab", "eagle", "elephant", "flamingo", "giraffe", "goat", "hippo", "horse", "human", "kangaroo", "lion", "ostrich", "rhino", "scorpion", "snake", "spider", "wasp", "wolf", "vulture", "peacock"],
+    &["bear", "racoon", "moose", "salmon", "eagle", "crow", "hummingbird", "watermelon", "mantis"],
+    &["salmon", "narwhal", "crab", "starfish", "shark", "walrus", "turtle", "stingray", "seahorse", "pufferfish", "octopus", "dolphin", "seagull"],
+    &["salmon", "narwhal", "crab", "starfish", "shark", "walrus", "turtle", "stingray", "seahorse", "pufferfish", "octopus", "dolphin", "seagull"],
+    &["alligator", "crow", "frog", "komodoDragon", "octopus", "raptor", "spider", "snake", "trex"],
+    &["alligator", "crow", "frog", "komodoDragon", "octopus", "raptor", "spider", "snake", "trex"],
+    &["bear", "bunny", "carrot", "chinchilla", "corn", "cow", "duck", "eagle", "fox", "goose", "grasshopper", "horse", "hedgehog", "moose", "mouse", "racoon", "red panda", "shiba inu", "skunk", "snail", "squirrel", "tree", "wolf"],
+    &["butterfly", "bunny", "chinchilla", "caterpillar", "chihuahua", "cookie", "corgi", "cupcake", "duck", "fox", "grasshopper", "hedgehog", "kitten", "ladybug", "mouse", "owl", "poodle", "pug", "red panda", "unicorn"],
 ];
 
 // ── Placed object (chunk element) ────────────────────────────────────────
@@ -636,7 +634,13 @@ impl WorldGenerator {
         let floor_tex = (rng_u32(chunk_seed, 0x01) as u64 % tex_count) as i16;
         let floor_rot = (rng_u32(chunk_seed, 0x02) % 4) as i16;
 
-        let (mob_a, mob_b) = BIOME_MOBS[biome as usize];
+        let animals = BIOME_ANIMALS[biome as usize];
+        let sector_salt = (sx as u64).wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add((sz as u64).wrapping_mul(0x6c62272e07bb0142));
+        let mob_seed = splitmix64(self.template.seed ^ sector_salt ^ 0x4d4f_4253);
+        // Two independent choices, with replacement, shared throughout a blob.
+        let mob_a = animals[rng_u32(mob_seed, blob_id as u64 * 2) as usize % animals.len()];
+        let mob_b = animals[rng_u32(mob_seed, blob_id as u64 * 2 + 1) as usize % animals.len()];
         let elements = self.generate_chunk_elements(chunk_x, chunk_z, biome);
 
         ChunkBiomeParams {
@@ -679,10 +683,7 @@ impl WorldGenerator {
 
         let total_weight: u32 = table.iter().map(|e| e.1).sum();
 
-        // SwampDark: 70% chance the chunk is completely empty.
-        if biome as u8 == BIOME_SWAMP_DARK && rng(10) >= 3 {
-            return Vec::new();
-        }
+        let empty_marsh = biome as u8 == BIOME_SWAMP_DARK && rng(10) >= 3;
 
         // Per-biome base object count range [min, max].
         let (min_obj, max_obj): (usize, usize) = match biome as u8 {
@@ -694,7 +695,8 @@ impl WorldGenerator {
             BIOME_SWAMP         => (1, 3),
             _                   => (2, 5),
         };
-        let num_objects = min_obj + rng((max_obj - min_obj + 1) as u32) as usize;
+        let num_objects = if empty_marsh { 0 }
+            else { min_obj + rng((max_obj - min_obj + 1) as u32) as usize };
 
         let mut occupied: u128 = 0;
         let mut elements: Vec<PlacedObject> = Vec::with_capacity(num_objects + 8);
@@ -1019,6 +1021,33 @@ impl WorldGenerator {
             }
         }
 
+        // Wildlife markers are turned into CreatureStructs by the client.
+        // Keep the client's spawn chance, count and sequential size rolls.
+        let mut value = || rng(16_777_216) as f32 / 16_777_216.0;
+        if value() < 0.251 {
+            let count = if value() < 0.55 { 1 } else { 2 };
+            let x = chunk_x as f32 * 10.0 + 5.0 + 7.6617;
+            let z = chunk_z as f32 * 10.0 + 5.0 - 6.4955;
+            let depth = (x * x + z * z + 0.762f32 * 0.762).sqrt();
+            let big = if depth >= 20.0 { (depth * 0.001 + 0.03).min(1.0) } else { 0.0 };
+            let giant = if depth >= 20.0 { (depth * 0.00023 + 0.1).min(0.4) } else { 0.0 };
+            let mut empty: Vec<u8> = (0..100).filter(|cell| occupied & (1u128 << cell) == 0).collect();
+            // Shuffle available cells without occupying existing objects.
+            for i in (1..empty.len()).rev() {
+                let j = (value() * (i + 1) as f32) as usize;
+                empty.swap(i, j.min(i));
+            }
+            for cell in empty.into_iter().take(count) {
+                let name = if value() < giant { "Mob - Giant" }
+                    else if value() < big { "Mob - Big" }
+                    else if value() < (depth * -0.0275 + 1.0).max(0.0) { "Mob - Tiny" }
+                    else { "Mob - Normal" };
+                elements.push(PlacedObject {
+                    cell_x: cell % 10, cell_z: cell / 10,
+                    rotation: 0, item_data: pack_item(name),
+                });
+            }
+        }
         elements
     }
 }
