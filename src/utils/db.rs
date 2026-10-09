@@ -11,7 +11,8 @@
 // Usernames are stored exactly as the player typed them at registration
 // (e.g. "ILuv").  The primary key uses COLLATE NOCASE so lookups with any
 // casing find the right row.  After any lookup callers should use the
-// returned `PlayerRow.username` as the canonical key for in-memory maps.
+// returned lowercase `PlayerRow.username` as the identity key for maps and packets.
+// Stored casing is retained only as the default display name.
 
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -106,7 +107,10 @@ impl Db {
     // ── Player queries ─────────────────────────────────────────────────────
 
     pub fn get_player(&self, username: &str) -> Option<PlayerRow> {
-        self.call(|tx| DbMsg::GetPlayer { username: username.to_owned(), tx })
+        self.call(|tx| DbMsg::GetPlayer { username: username.to_owned(), tx }).map(|mut row| {
+            row.username = crate::utils::text::username_key(&row.username);
+            row
+        })
     }
 
     pub fn get_display_name(&self, username: &str) -> String {
@@ -149,7 +153,7 @@ impl Db {
     // ── Friend queries ─────────────────────────────────────────────────────
 
     pub fn get_friends(&self, username: &str) -> Vec<String> {
-        self.call(|tx| DbMsg::GetFriends { username: username.to_owned(), tx })
+        self.call(|tx| DbMsg::GetFriends { username: username.to_owned(), tx }).into_iter().map(|user| crate::utils::text::username_key(&user)).collect()
     }
 
     pub fn are_friends(&self, a: &str, b: &str) -> bool {
@@ -157,11 +161,11 @@ impl Db {
     }
 
     pub fn get_pending_inbound(&self, username: &str) -> Vec<String> {
-        self.call(|tx| DbMsg::GetPendingInbound { username: username.to_owned(), tx })
+        self.call(|tx| DbMsg::GetPendingInbound { username: username.to_owned(), tx }).into_iter().map(|user| crate::utils::text::username_key(&user)).collect()
     }
 
     pub fn get_pending_outbound(&self, username: &str) -> Vec<String> {
-        self.call(|tx| DbMsg::GetPendingOutbound { username: username.to_owned(), tx })
+        self.call(|tx| DbMsg::GetPendingOutbound { username: username.to_owned(), tx }).into_iter().map(|user| crate::utils::text::username_key(&user)).collect()
     }
 
     pub fn has_pending(&self, from: &str, to: &str) -> bool {
@@ -265,7 +269,7 @@ fn db_worker(conn: Connection, rx: mpsc::Receiver<DbMsg>) {
             }
             DbMsg::GetFriends { username, tx } => {
                 let mut stmt = conn.prepare(
-                    "SELECT user_b FROM friends WHERE user_a = ?1 ORDER BY user_b",
+                    "SELECT user_b FROM friends WHERE user_a = ?1 COLLATE NOCASE ORDER BY user_b",
                 ).unwrap();
                 let v: Vec<String> = stmt
                     .query_map(params![username], |row| row.get(0))
@@ -274,7 +278,7 @@ fn db_worker(conn: Connection, rx: mpsc::Receiver<DbMsg>) {
             }
             DbMsg::AreFriends { a, b, tx } => {
                 let ok = conn.query_row(
-                    "SELECT 1 FROM friends WHERE user_a = ?1 AND user_b = ?2",
+                    "SELECT 1 FROM friends WHERE user_a = ?1 COLLATE NOCASE AND user_b = ?2 COLLATE NOCASE",
                     params![a, b],
                     |_| Ok(()),
                 ).is_ok();
@@ -282,7 +286,7 @@ fn db_worker(conn: Connection, rx: mpsc::Receiver<DbMsg>) {
             }
             DbMsg::GetPendingInbound { username, tx } => {
                 let mut stmt = conn.prepare(
-                    "SELECT from_user FROM pending WHERE to_user = ?1 ORDER BY from_user",
+                    "SELECT from_user FROM pending WHERE to_user = ?1 COLLATE NOCASE ORDER BY from_user",
                 ).unwrap();
                 let v: Vec<String> = stmt
                     .query_map(params![username], |row| row.get(0))
@@ -291,7 +295,7 @@ fn db_worker(conn: Connection, rx: mpsc::Receiver<DbMsg>) {
             }
             DbMsg::GetPendingOutbound { username, tx } => {
                 let mut stmt = conn.prepare(
-                    "SELECT to_user FROM pending WHERE from_user = ?1 ORDER BY to_user",
+                    "SELECT to_user FROM pending WHERE from_user = ?1 COLLATE NOCASE ORDER BY to_user",
                 ).unwrap();
                 let v: Vec<String> = stmt
                     .query_map(params![username], |row| row.get(0))
@@ -300,7 +304,7 @@ fn db_worker(conn: Connection, rx: mpsc::Receiver<DbMsg>) {
             }
             DbMsg::HasPending { from, to, tx } => {
                 let ok = conn.query_row(
-                    "SELECT 1 FROM pending WHERE from_user = ?1 AND to_user = ?2",
+                    "SELECT 1 FROM pending WHERE from_user = ?1 COLLATE NOCASE AND to_user = ?2 COLLATE NOCASE",
                     params![from, to],
                     |_| Ok(()),
                 ).is_ok();
@@ -321,8 +325,8 @@ fn db_worker(conn: Connection, rx: mpsc::Receiver<DbMsg>) {
                 let n = conn.execute(
                     "DELETE FROM pending WHERE EXISTS (
                         SELECT 1 FROM friends
-                        WHERE friends.user_a = pending.from_user
-                          AND friends.user_b = pending.to_user
+                        WHERE friends.user_a = pending.from_user COLLATE NOCASE
+                          AND friends.user_b = pending.to_user COLLATE NOCASE
                     )",
                     [],
                 ).unwrap_or(0);
@@ -371,12 +375,12 @@ fn worker_get_player(conn: &Connection, username: &str) -> Option<PlayerRow> {
 
 fn worker_get_display_name(conn: &Connection, username: &str) -> String {
     let row = conn.query_row(
-        "SELECT display_name, COALESCE(is_moderator, 0) FROM players WHERE username = ?1",
+        "SELECT display_name, COALESCE(is_moderator, 0), username FROM players WHERE username = ?1",
         params![username],
-        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
     ).ok();
     let (raw, is_mod) = match row {
-        Some((r, m)) => (r.unwrap_or_else(|| username.to_string()), m != 0),
+        Some((r, m, original)) => (r.unwrap_or(original), m != 0),
         None         => (username.to_string(), false),
     };
     if is_mod { format!("{} <color=#FFFF00>★</color>", raw) } else { raw }
@@ -396,11 +400,11 @@ fn worker_add_friend_request(conn: &Connection, from: &str, to: &str) -> bool {
     if !from_exists || !to_exists { return false; }
 
     let already_friends = conn.query_row(
-        "SELECT 1 FROM friends WHERE user_a = ?1 AND user_b = ?2",
+        "SELECT 1 FROM friends WHERE user_a = ?1 COLLATE NOCASE AND user_b = ?2 COLLATE NOCASE",
         params![from, to], |_| Ok(()),
     ).is_ok();
     let has_pending = conn.query_row(
-        "SELECT 1 FROM pending WHERE from_user = ?1 AND to_user = ?2",
+        "SELECT 1 FROM pending WHERE from_user = ?1 COLLATE NOCASE AND to_user = ?2 COLLATE NOCASE",
         params![from, to], |_| Ok(()),
     ).is_ok();
     if already_friends || has_pending { return false; }
@@ -415,7 +419,7 @@ fn worker_accept_friend(conn: &Connection, acceptor: &str, requester: &str) -> b
     conn.execute_batch("BEGIN;").ok();
 
     let n = conn.execute(
-        "DELETE FROM pending WHERE from_user = ?1 AND to_user = ?2",
+        "DELETE FROM pending WHERE from_user = ?1 COLLATE NOCASE AND to_user = ?2 COLLATE NOCASE",
         params![requester, acceptor],
     ).unwrap_or(0);
 
@@ -426,7 +430,7 @@ fn worker_accept_friend(conn: &Connection, acceptor: &str, requester: &str) -> b
 
     // Remove any reverse-direction pending to avoid ghost outbound entries.
     conn.execute(
-        "DELETE FROM pending WHERE from_user = ?1 AND to_user = ?2",
+        "DELETE FROM pending WHERE from_user = ?1 COLLATE NOCASE AND to_user = ?2 COLLATE NOCASE",
         params![acceptor, requester],
     ).unwrap_or(0);
     conn.execute(
@@ -446,12 +450,12 @@ fn worker_remove_friend(conn: &Connection, a: &str, b: &str) {
     conn.execute_batch("BEGIN;").ok();
     conn.execute(
         "DELETE FROM friends
-         WHERE (user_a = ?1 AND user_b = ?2) OR (user_a = ?2 AND user_b = ?1)",
+         WHERE (user_a = ?1 COLLATE NOCASE AND user_b = ?2 COLLATE NOCASE) OR (user_a = ?2 COLLATE NOCASE AND user_b = ?1 COLLATE NOCASE)",
         params![a, b],
     ).unwrap_or(0);
     conn.execute(
         "DELETE FROM pending
-         WHERE (from_user = ?1 AND to_user = ?2) OR (from_user = ?2 AND to_user = ?1)",
+         WHERE (from_user = ?1 COLLATE NOCASE AND to_user = ?2 COLLATE NOCASE) OR (from_user = ?2 COLLATE NOCASE AND to_user = ?1 COLLATE NOCASE)",
         params![a, b],
     ).unwrap_or(0);
     conn.execute_batch("COMMIT;").ok();
@@ -512,6 +516,8 @@ fn migrate(conn: &Connection) -> SqlResult<()> {
             .flatten()
             .collect()
     };
+
+    if cols.is_empty() { return Ok(()); } // Fresh database: SCHEMA creates the table.
 
     if cols.iter().any(|c| c == "display") {
         println!("[DB] Migrating schema v1→v2: dropping display column, adding COLLATE NOCASE …");
@@ -583,3 +589,37 @@ CREATE TABLE IF NOT EXISTS reports (
     reason    TEXT    NOT NULL
 );
 ";
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_mixed_case_accounts_have_lowercase_identities_and_original_displays() {
+        let db = Db::open(":memory:").unwrap();
+        assert!(db.create_player("User", "token"));
+        assert!(db.create_player("user2", "token2"));
+        assert_eq!(db.get_player("USER").unwrap().username, "user");
+        assert_eq!(db.get_player("user2").unwrap().username, "user2");
+        assert_eq!(db.get_display_name("user"), "User");
+        assert!(db.set_display_name("USER", "<color=yellow>User</color>"));
+        assert_eq!(db.get_player("user").unwrap().username, "user");
+        assert_eq!(db.get_display_name("user"), "<color=yellow>User</color>");
+    }
+
+    #[test]
+    fn legacy_friend_edges_work_after_session_names_are_normalized() {
+        let db = Db::open(":memory:").unwrap();
+        assert!(db.create_player("User", "token"));
+        assert!(db.create_player("User2", "token2"));
+        assert!(db.add_friend_request("User", "User2"));
+        assert_eq!(db.get_pending_inbound("user2"), vec!["user"]);
+        assert_eq!(db.get_pending_outbound("user"), vec!["user2"]);
+        assert!(db.has_pending("USER", "USER2"));
+        assert!(db.accept_friend("user2", "user"));
+        assert!(db.are_friends("USER", "USER2"));
+        assert_eq!(db.get_friends("USER"), vec!["user2"]);
+        db.remove_friend("USER", "USER2");
+        assert!(db.get_friends("user").is_empty());
+    }
+}

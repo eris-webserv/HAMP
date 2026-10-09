@@ -188,6 +188,7 @@ pub struct InteriorInfo<'a> {
 pub struct ZoneData<'a> {
     pub zone_name: &'a str,
     pub interior: Option<InteriorInfo<'a>>,
+    pub claims: &'a [super::land_claims::LandClaim],
 }
 impl ServerPacket for ZoneData<'_> {
     fn to_payload(&self) -> Vec<u8> {
@@ -214,7 +215,8 @@ impl ServerPacket for ZoneData<'_> {
                 p.extend(pack_string(self.zone_name)); // outer_item_zone = self for plain zones
             }
         }
-        p.extend_from_slice(&0i16.to_le_bytes()); // timer_count = 0
+        p.extend_from_slice(&(self.claims.len() as i16).to_le_bytes());
+        for claim in self.claims { claim.pack_zone(&mut p); }
         p.push(0x00); // type
         p
     }
@@ -239,17 +241,18 @@ impl ServerPacket for DayNight {
 //
 // IDA confirmed: client reads uid FIRST (used as dictionary key when
 // joined=0 to release unique IDs back to the pool), display SECOND.
-// Using username for both uid and display is correct for managed sessions.
+// Identity stays lowercase; display retains the punctuated spelling.
 
 pub struct JoinNotif<'a> {
     pub username: &'a str,
+    pub display:  &'a str,
     pub joined:   bool,
 }
 impl ServerPacket for JoinNotif<'_> {
     fn to_payload(&self) -> Vec<u8> {
         let mut p = vec![0x07u8];
         p.extend(pack_string(self.username)); // uid  — used for ID cleanup on leave
-        p.extend(pack_string(self.username)); // display
+        p.extend(pack_string(self.display));
         p.push(self.joined as u8);
         p
     }
@@ -770,13 +773,13 @@ mod tests {
 
     #[test]
     fn join_notif_layout() {
-        let pkt = JoinNotif { username: "carol", joined: false }.to_payload();
+        let pkt = JoinNotif { username: "carol", display: "Carol", joined: false }.to_payload();
         assert_eq!(pkt[0], 0x07);
         let (uid, off)  = get_string(&pkt, 1);
         let (disp, off) = get_string(&pkt, off);
         let (join, off) = get_byte(&pkt, off);
         assert_eq!(uid, "carol");
-        assert_eq!(disp, "carol");
+        assert_eq!(disp, "Carol");
         assert_eq!(join, 0);
         assert_eq!(off, pkt.len());
     }

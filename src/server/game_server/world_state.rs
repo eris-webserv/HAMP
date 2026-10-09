@@ -15,8 +15,8 @@
 //   [n_ints:i16] [n × (key:str, val:i32)]
 
 use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, RwLock};
+use super::land_claims::{LandClaim, unix_now};
 
 use crate::defs::packet::pack_string;
 use crate::server::game_server::baskets::BasketStore;
@@ -54,46 +54,6 @@ pub struct WorldRotation {
 impl Default for WorldRotation {
     fn default() -> Self {
         Self { qx: 0, qy: 0, qz: 0, qw: 100 } // identity quaternion
-    }
-}
-
-// ── Land claim ────────────────────────────────────────────────────────────
-
-/// A land claim on a chunk.  The claim_key has format "zone,chunkX,chunkZ,innerX,innerZ".
-/// The same claim is stored on all 3×3 neighbouring chunks for proximity checks.
-pub struct LandClaim {
-    pub claim_key: String,
-    /// Owner username.
-    pub user0: String,
-    /// Trusted user slot 1.
-    pub user1: String,
-    /// Trusted user slot 2.
-    pub user2: String,
-    /// Unix seconds at expiry.
-    pub expires_at_secs: u64,
-}
-
-impl LandClaim {
-    pub fn new(claim_key: String, owner: String, days: u64) -> Self {
-        let expires_at_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-            + days * 86400;
-        Self { claim_key, user0: owner, user1: String::new(), user2: String::new(), expires_at_secs }
-    }
-
-    fn is_expired(&self) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.expires_at_secs <= now
-    }
-
-    fn remaining_dhms(&self) -> (i16, i16, i16, i16) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let total = self.expires_at_secs.saturating_sub(now);
-        let d = (total / 86400) as i16;
-        let h = ((total % 86400) / 3600) as i16;
-        let m = ((total % 3600) / 60) as i16;
-        let s = (total % 60) as i16;
-        (d, h, m, s)
     }
 }
 
@@ -164,7 +124,6 @@ pub struct Chunk {
     pub mob_a: String,
     pub mob_b: String,
     pub elements: Vec<ChunkElement>,
-    pub land_claims: HashMap<String, LandClaim>,
 }
 
 impl Chunk {
@@ -181,7 +140,6 @@ impl Chunk {
             mob_a: String::new(),
             mob_b: String::new(),
             elements: Vec::new(),
-            land_claims: HashMap::new(),
         }
     }
 
@@ -196,6 +154,10 @@ impl Chunk {
     ///   [u8 tile_count][tiles...][i16 land_claim_count][claims...]
     /// After UnpackFromWeb, case 0x0D reads: [i16 bandit_camp_count][camps...]
     pub fn to_wire(&self) -> Vec<u8> {
+        self.to_wire_with_claims(&[])
+    }
+
+    pub fn to_wire_with_claims(&self, claims: &[LandClaim]) -> Vec<u8> {
         let mut p = vec![0x0Du8];
 
         // ── Outer envelope ──
@@ -223,7 +185,9 @@ impl Chunk {
         }
 
         p.push(cells.len() as u8); // occupied_tile_count
-        for ((cx, cz), items) in &cells {
+        let mut ordered_cells: Vec<_> = cells.iter().collect();
+        ordered_cells.sort_by_key(|(cell, _)| **cell);
+        for ((cx, cz), items) in ordered_cells {
             p.push(*cx);
             p.push(*cz);
             p.extend_from_slice(&(items.len() as i16).to_le_bytes());
@@ -233,22 +197,10 @@ impl Chunk {
             }
         }
 
-        // land claims
-        let active: Vec<&LandClaim> = self.land_claims.values()
-            .filter(|c| !c.is_expired())
-            .collect();
-        p.extend_from_slice(&(active.len() as i16).to_le_bytes());
-        for claim in &active {
-            let (d, h, m, s) = claim.remaining_dhms();
-            p.extend(pack_string(&claim.claim_key));
-            p.extend(pack_string(&claim.user0));
-            p.extend(pack_string(&claim.user1));
-            p.extend(pack_string(&claim.user2));
-            p.extend_from_slice(&d.to_le_bytes());
-            p.extend_from_slice(&h.to_le_bytes());
-            p.extend_from_slice(&m.to_le_bytes());
-            p.extend_from_slice(&s.to_le_bytes());
-        }
+        // Claims are supplied from the authoritative world-level registry.
+        let now = unix_now();
+        p.extend_from_slice(&(claims.len() as i16).to_le_bytes());
+        for claim in claims { claim.pack_chunk(&mut p, now); }
         // bandit_camp_count = 0 (read by case 0x0D outer handler via GetShort)
         p.extend_from_slice(&0i16.to_le_bytes());
         p
@@ -317,6 +269,9 @@ pub struct WorldState {
     pub name: String,
     pub default_zone: String,
     pub chunks: RwLock<HashMap<String, HashMap<(i16, i16), Chunk>>>,
+    pub land_claims: RwLock<HashMap<String, LandClaim>>,
+    /// Serialize permission checks, mutations, expiry, and persistence snapshots.
+    pub(crate) mutation_lock: Mutex<()>,
     pub players: RwLock<HashMap<String, TrackedPlayer>>,
     pub baskets: BasketStore,
     /// All known zones keyed by name. Pre-populated from the template; extended at runtime
@@ -354,8 +309,7 @@ impl WorldState {
                     mob_a:       params.mob_a,
                     mob_b:       params.mob_b,
                     elements:    params.elements.into_iter().map(placed_to_element).collect(),
-                    land_claims: HashMap::new(),
-                });
+                        });
             }
         }
 
@@ -371,6 +325,8 @@ impl WorldState {
             name: name.to_string(),
             default_zone,
             chunks: RwLock::new(chunks),
+            land_claims: RwLock::new(HashMap::new()),
+            mutation_lock: Mutex::new(()),
             players: RwLock::new(HashMap::new()),
             baskets: BasketStore::new(),
             zones: RwLock::new(zone_map),
@@ -382,11 +338,13 @@ impl WorldState {
     /// Returns the wire-encoded chunk at (zone, x, z), generating one if missing.
     /// Interior zones are never lazily generated; only the default zone supports lazy gen.
     pub fn get_chunk_wire(&self, zone: &str, x: i16, z: i16) -> Vec<u8> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let claims = self.claims_at(zone, x, z, unix_now());
         {
             let chunks = self.chunks.read().unwrap();
             if let Some(m) = chunks.get(zone) {
                 if let Some(chunk) = m.get(&(x, z)) {
-                    return chunk.to_wire();
+                    return chunk.to_wire_with_claims(&claims);
                 }
             }
         }
@@ -411,7 +369,7 @@ impl WorldState {
                     let fm = special_generators::cave_floor_model(item_id);
                     (special_generators::generate_cave_chunk(world_seed, shack_id, x, z, item_id), fm)
                 }
-                ZoneKind::House => return Chunk::blank(x, z, zone).to_wire(),
+                ZoneKind::House => return Chunk::blank(x, z, zone).to_wire_with_claims(&claims),
             };
 
             let chunk = Chunk {
@@ -424,9 +382,8 @@ impl WorldState {
                 mob_a:       params.mob_a,
                 mob_b:       params.mob_b,
                 elements:    params.elements.into_iter().map(placed_to_element).collect(),
-                land_claims: HashMap::new(),
-            };
-            let wire = chunk.to_wire();
+                };
+            let wire = chunk.to_wire_with_claims(&claims);
             self.chunks.write().unwrap()
                 .entry(zone.to_string())
                 .or_default()
@@ -435,7 +392,7 @@ impl WorldState {
         }
 
         if !worldgen {
-            return Chunk::blank(x, z, zone).to_wire();
+            return Chunk::blank(x, z, zone).to_wire_with_claims(&claims);
         }
 
         let params = self.generator.chunk_params(zone, x as i32, z as i32);
@@ -450,9 +407,8 @@ impl WorldState {
             mob_a:       params.mob_a,
             mob_b:       params.mob_b,
             elements:    params.elements.into_iter().map(placed_to_element).collect(),
-            land_claims: HashMap::new(),
         };
-        let wire = chunk.to_wire();
+        let wire = chunk.to_wire_with_claims(&claims);
         self.chunks.write().unwrap()
             .entry(zone.to_string())
             .or_default()
@@ -460,39 +416,6 @@ impl WorldState {
         wire
     }
 
-    /// Adds a land claim to all 9 chunks in the 3×3 neighbourhood of (chunk_x, chunk_z).
-    /// The claim key is always relative to the centre chunk.
-    pub fn add_land_claims(&self, zone: &str, chunk_x: i16, chunk_z: i16, inner_x: i16, inner_z: i16, owner: &str, days: u64) {
-        let claim_key = format!("{},{},{},{},{}", zone, chunk_x, chunk_z, inner_x, inner_z);
-        let mut chunks = self.chunks.write().unwrap();
-        let worldgen = self.zones.read().unwrap().get(zone).map_or(false, |e| e.worldgen);
-        for dx in -1i16..=1 {
-            for dz in -1i16..=1 {
-                let cx = chunk_x + dx;
-                let cz = chunk_z + dz;
-                let chunk = chunks.entry(zone.to_string()).or_default()
-                    .entry((cx, cz)).or_insert_with(|| {
-                        if worldgen {
-                            let p = self.generator.chunk_params(zone, cx as i32, cz as i32);
-                            Chunk {
-                                x: cx, z: cz, zone: zone.to_string(),
-                                biome: p.biome, floor_rot: p.floor_rot,
-                                floor_tex: p.floor_tex, floor_model: 0,
-                                mob_a: p.mob_a, mob_b: p.mob_b,
-                                elements: p.elements.into_iter().map(placed_to_element).collect(),
-                                land_claims: HashMap::new(),
-                            }
-                        } else {
-                            Chunk::blank(cx, cz, zone)
-                        }
-                    });
-                chunk.land_claims.insert(claim_key.clone(), LandClaim::new(claim_key.clone(), owner.to_string(), days));
-            }
-        }
-    }
-
-    /// Creates or updates the teleporter at the given location (C→S 0x33).
-    /// `editor` becomes `built_by` only on first creation.
     pub fn upsert_teleporter(&self, zone: &str, cx: i16, cz: i16, tx: i16, tz: i16, title: &str, desc: &str, editor: &str) {
         let mut teles = self.teleporters.write().unwrap();
         if let Some(t) = teles.iter_mut().find(|t| t.is_at(zone, cx, cz, tx, tz)) {
@@ -533,21 +456,4 @@ impl WorldState {
         self.teleporters.write().unwrap().retain(|t| !t.is_at(zone, cx, cz, tx, tz));
     }
 
-    /// Updates a single user slot on the claim at (chunk_x, chunk_z, inner_x, inner_z).
-    /// user_index: 0 = owner (user0), 1 = user1, 2 = user2.
-    pub fn update_land_claim_user(&self, zone: &str, chunk_x: i16, chunk_z: i16, inner_x: i16, inner_z: i16, user_index: u8, username: &str) {
-        let claim_key = format!("{},{},{},{},{}", zone, chunk_x, chunk_z, inner_x, inner_z);
-        if let Some(chunk) = self.chunks.write().unwrap()
-            .get_mut(zone).and_then(|m| m.get_mut(&(chunk_x, chunk_z)))
-        {
-            if let Some(claim) = chunk.land_claims.get_mut(&claim_key) {
-                match user_index {
-                    0 => claim.user0 = username.to_string(),
-                    1 => claim.user1 = username.to_string(),
-                    2 => claim.user2 = username.to_string(),
-                    _ => {}
-                }
-            }
-        }
-    }
 }

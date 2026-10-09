@@ -1,5 +1,11 @@
 // text.rs — text sanitisation helpers.
 
+/// Account identity used in protocol identity fields and permission checks.
+/// Display names (including Unity markup) are deliberately handled separately.
+pub fn username_key(username: &str) -> String {
+    username.trim().to_lowercase()
+}
+
 /// Strips Unity Rich Text markup tags from `s`, returning plain text.
 ///
 /// Unity Rich Text uses HTML-like tags: `<b>`, `</b>`, `<color=#ff0000>`,
@@ -27,6 +33,13 @@ pub fn strip_rich_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usernames_are_case_insensitive_without_losing_punctuation() {
+        assert_eq!(username_key("User"), "user");
+        assert_eq!(username_key("user2"), "user2");
+        assert_eq!(username_key(" User.Name_2 "), "user.name_2");
+    }
 
     #[test]
     fn strips_color_and_italic() {

@@ -98,6 +98,28 @@ pub struct RegistryHandle {
 }
 
 impl RegistryHandle {
+    #[cfg(test)]
+    pub(super) fn display_fixture(names: &[(&str, &str)]) -> Self {
+        let names: HashMap<String, String> = names.iter()
+            .map(|(name, display)| (name.to_string(), display.to_string())).collect();
+        let (write_tx, requests) = mpsc::channel();
+        let pending = Arc::new(Mutex::new(HashMap::<u16, mpsc::Sender<Option<String>>>::new()));
+        let responses = pending.clone();
+        std::thread::spawn(move || {
+            while let Ok(OutMsg::Bytes(bytes)) = requests.recv() {
+                assert_eq!(bytes[0], 5);
+                assert_eq!(bytes[3], 1);
+                let id = u16::from_le_bytes([bytes[1], bytes[2]]);
+                let length = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+                let requested = std::str::from_utf8(&bytes[6..6 + length]).unwrap();
+                if let Some(response) = responses.lock().unwrap().remove(&id) {
+                    response.send(names.get(requested).cloned()).unwrap();
+                }
+            }
+        });
+        Self { write_tx, pending, next_id: Arc::new(AtomicU16::new(1)) }
+    }
+
     /// Asks the friend server for the display name of `username`.
     ///
     /// Blocks up to 5 seconds waiting for the response.

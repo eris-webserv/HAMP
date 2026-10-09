@@ -95,6 +95,8 @@ pub struct Config {
     pub start_biome_radius: i16,
 
     /// Usernames treated as administrators on the managed game server.
+    /// Only these accounts may place permanent Admin Land Claims. Other players
+    /// attempting placement are disconnected and their placement is discarded.
     /// Teleporters set up by these users are listed first and marked with ★
     /// in the teleporter list, standing in for the old public servers'
     /// separate moderator-teleporter list.
@@ -310,8 +312,11 @@ start_biome        = "Grassland"
 start_biome_radius = 3
 
 # Usernames treated as administrators on the managed game server.
+# Only these accounts may place permanent Admin Land Claims.
+# Other players attempting placement are kicked and the placement is discarded.
 # Their teleporters are listed first and marked with ★.
-# admin_users = ["SomeAdmin", "AnotherAdmin"]
+# Example: admin_users = ["SomeAdmin", "AnotherAdmin"]
+admin_users = []
 
 # Enable player-vs-player combat (default: false).
 # pvp_enabled = false

@@ -36,6 +36,41 @@ pub struct RegisterOk {
 }
 impl_server_packet!(RegisterOk, 0x0A);
 
+impl RegisterOk {
+    pub fn for_account(username: &str, token: &str) -> Self {
+        let identity = crate::utils::text::username_key(username);
+        Self {
+            username: Str16::new(&identity),
+            // Preserve the player's spelling in username_punctuated.
+            display: Str16::new(username),
+            token: Str16::new(token),
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::defs::packet::unpack_string;
+
+    #[test]
+    fn registration_lowercases_identity_and_preserves_punctuated_spelling() {
+        for (input, expected) in [("ASDFASDF", "asdfasdf"), ("User", "user"), ("user2", "user2"), ("User.Name", "user.name")] {
+            let packet = RegisterOk::for_account(input, "token").to_payload();
+            assert_eq!(&packet[..2], &[10, 1]);
+            let (username_lower, next) = unpack_string(&packet, 2);
+            let (username_punctuated, next) = unpack_string(&packet, next);
+            let (token, end) = unpack_string(&packet, next);
+            assert_eq!(username_lower, expected);
+            assert_eq!(username_punctuated, input);
+            assert_eq!(token, "token");
+            assert_eq!(end, packet.len());
+            // Ordinary claim owner/whitelist comparisons use username_lower.
+            assert_eq!(input.to_lowercase(), username_lower);
+        }
+    }
+}
+
 /// `0x0A 0x02` — registration rejected (username already taken).
 ///
 /// Wire (after packet-ID): [0x02] [reason: Str16]

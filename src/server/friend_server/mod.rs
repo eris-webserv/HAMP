@@ -209,13 +209,12 @@ pub fn handle_packet(
                 );
             } else {
                 let token = random_token();
-                state.db.create_player(&username, &token);
+                if !state.db.create_player(&username, &token) {
+                    conn.send_pkt(&RegisterFail { name: Str16::new(&username) }, "S->C [REG_FAIL]");
+                    return;
+                }
                 conn.send_pkt(
-                    &RegisterOk {
-                        username: Str16::new(&username),
-                        display:  Str16::new(&username),
-                        token:    Str16::new(&token),
-                    },
+                    &RegisterOk::for_account(&username, &token),
                     "S->C [REG_OK]",
                 );
             }
@@ -228,7 +227,7 @@ pub fn handle_packet(
             let authed = player.as_ref().map(|p| p.token == token).unwrap_or(false);
 
             if authed {
-                // Use the stored casing as the canonical session key.
+                // Db returns the lowercase account identity, not display casing.
                 let canonical = player.unwrap().username;
                 *current_user = Some(canonical.clone());
 
